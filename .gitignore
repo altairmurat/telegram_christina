@@ -1,0 +1,50 @@
+# Secrets & Env
+.env
+*.env
+.env.*
+!.env.example
+credentials.json
+client_secret*.json
+*.token
+token.json
+tokens/
+
+# Telegram session files
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# DGIST user data / sessions / cookies / browser profiles
+user_data/
+browser_profile/
+session_cookie.txt
+debug_listbbs.html
+seen_ids.json
+summaries_log.jsonl
+
+# Playwright
+playwright-report/
+test-results/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
