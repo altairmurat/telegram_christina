@@ -149,10 +149,23 @@ def login_and_get_cookie(dgist_user, dgist_pass, email_addr, email_pass, profile
             try: ctx.close()
             except Exception: pass
 
-def login_for_telegram_user(uid: int, dgist_user, dgist_pass, email_addr, email_pass, imap_host="imap.gmail.com"):
+def login_for_telegram_user(
+    telegram_user_id: int = None,
+    dgist_username: str = None,
+    dgist_password: str = None,
+    email_address: str = None,
+    email_app_password: str = None,
+    imap_host: str = "imap.gmail.com",
+    **kwargs
+):
+    uid = telegram_user_id or kwargs.get("uid")
+    u = dgist_username or kwargs.get("dgist_user")
+    pw = dgist_password or kwargs.get("dgist_pass")
+    em = email_address or kwargs.get("email_addr")
+    ep = email_app_password or kwargs.get("email_pass")
     from dgist_monitor import build_user_paths
     p = build_user_paths(uid)
-    return login_and_get_cookie(dgist_user, dgist_pass, email_addr, email_pass, p["browser_profile_dir"], p["cookie_file"], imap_host)
+    return login_and_get_cookie(u, pw, em, ep, p["browser_profile_dir"], p["cookie_file"], imap_host)
 
 if __name__ == "__main__":
     u, p = os.getenv("DGIST_USERNAME"), os.getenv("DGIST_PASSWORD")
