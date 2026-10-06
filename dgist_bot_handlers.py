@@ -4,7 +4,7 @@ import dgist_monitor
 from dgist_accounts import save_dgist_account, load_dgist_account, delete_dgist_account, list_dgist_user_ids
 
 _active_portal_checks = set()
-AUTO_CHECK_INTERVAL_SEC = 5 * 60 * 60
+AUTO_CHECK_INTERVAL_SEC = 11 * 60 * 60
 _auto_monitor_task = None
 
 def register_dgist_handlers(client, user_states: dict):
