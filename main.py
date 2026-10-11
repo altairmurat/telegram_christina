@@ -1,4 +1,5 @@
-import os, asyncio, base64, hashlib, secrets, json, re, urllib.parse
+import os, io, asyncio, base64, hashlib, secrets, json, re, urllib.parse
+from collections import defaultdict
 from email.message import EmailMessage
 from fastapi import FastAPI, Request as FastAPIRequest
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
@@ -13,14 +14,18 @@ from telethon import TelegramClient, events, Button, types
 from env import API_ID, API_HASH, BOT_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI, WEBAPP_URL
 from database import SessionLocal, engine
 import models
-from llm import ask_gemini, transcribe_voice, process_telegram_image, parse_email_intent, generate_email_text
+from llm import (
+    ask_gemini, transcribe_voice, process_telegram_images,
+    parse_user_intent, generate_email_text, generate_pdf_from_prompt
+)
 from dgist_bot_handlers import register_dgist_handlers, handle_dgist_conversation_step
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 app = FastAPI()
 client = TelegramClient('session_bot_korean', API_ID, API_HASH)
 
-user_states, pending_photos, draft_cache, text_cache, pkce_store = {}, {}, {}, {}, {}
+user_states, draft_cache, text_cache, pkce_store = {}, {}, {}, {}
+pending_photos, pending_captions, photo_tasks = defaultdict(list), {}, {}
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.readonly"]
 CLIENT_CONFIG = {"web": {"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
@@ -172,7 +177,21 @@ async def send_draft_to_telegram(event, gmail, user_id: int, to: str, name: str,
         await msg.edit(txt, buttons=fallback_btns)
 
 async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
-    intent = await parse_email_intent(text)
+    intent = await parse_user_intent(text)
+    if intent.is_pdf:
+        status = await event.reply("📄 Генерирую LaTeX-код и собираю PDF-файл, подожди пару секунд...")
+        try:
+            pdf_bytes = await generate_pdf_from_prompt(text, user_id=user_id)
+            fname = (intent.pdf_filename or "document.pdf").strip()
+            if not fname.lower().endswith(".pdf"): fname += ".pdf"
+            pdf_file = io.BytesIO(pdf_bytes)
+            pdf_file.name = fname
+            await client.send_file(event.chat_id, pdf_file, caption=f"✅ Готово! Документ: **{fname}**", reply_to=event.id)
+            await status.delete()
+        except Exception as ex:
+            await status.edit(f"❌ Не удалось сгенерировать PDF: {ex}")
+        return True
+
     if not intent.is_email: return False
     gmail = await asyncio.to_thread(get_gmail_client_for, user_id)
     if not gmail:
@@ -339,17 +358,50 @@ async def necessary_task_handler(event):
         finally: user_states.pop(uid, None)
 
     elif event.photo:
-        pending_photos[uid] = event.message
-        user_states[uid] = "waiting_for_imageprompt"
-        await event.respond("Получила фотку! Что с ней сделать?")
+        prev_task = photo_tasks.get(uid)
+        if state != "waiting_for_imageprompt" and (not prev_task or prev_task.done()):
+            pending_photos[uid].clear()
+            pending_captions.pop(uid, None)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        if len(pending_photos[uid]) < 10:
+            pending_photos[uid].append(event.message)
+        if event.raw_text and event.raw_text.strip():
+            pending_captions[uid] = event.raw_text.strip()
+
+        async def _flush_photos(u=uid, ev=event):
+            await asyncio.sleep(0.8)
+            cap = pending_captions.pop(u, None)
+            if cap:
+                msgs = list(pending_photos.pop(u, []))
+                user_states.pop(u, None)
+                if msgs:
+                    st = await ev.reply(f"⏳ Обрабатываю фото ({len(msgs)} шт.)...")
+                    try:
+                        ans = await process_telegram_images(msgs, cap, user_id=u)
+                        await st.edit(ans)
+                    except Exception as ex:
+                        await st.edit(f"❌ Ошибка: {ex}")
+            else:
+                user_states[u] = "waiting_for_imageprompt"
+                await ev.respond(f"📸 Получила фото ({len(pending_photos[u])}/10 шт.)! Что с ними сделать?")
+
+        photo_tasks[uid] = asyncio.create_task(_flush_photos())
 
     elif state == "waiting_for_imageprompt" and event.text:
-        pm = pending_photos.pop(uid, None)
+        prev_task = photo_tasks.pop(uid, None)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        msgs = list(pending_photos.pop(uid, []))
+        pending_captions.pop(uid, None)
         user_states.pop(uid, None)
-        if pm:
-            await event.respond("Обрабатываю...")
-            try: await event.respond(await process_telegram_image(pm, event.text))
-            except Exception as ex: await event.respond(f"Ошибка: {ex}")
+        if msgs:
+            st = await event.reply(f"⏳ Обрабатываю фото ({len(msgs)} шт.)...")
+            try:
+                ans = await process_telegram_images(msgs, event.text, user_id=uid)
+                await st.edit(ans)
+            except Exception as ex:
+                await st.edit(f"❌ Ошибка: {ex}")
 
     elif event.text:
         try:

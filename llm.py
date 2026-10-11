@@ -1,4 +1,4 @@
-import os
+import os, re, asyncio, requests
 from collections import defaultdict, deque
 from google import genai
 from google.genai import types
@@ -10,27 +10,41 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-user_contexts = defaultdict(lambda: deque(maxlen=10))
+# 10 пар сообщений (10 от пользователя + 10 ответов ассистента = 20 элементов)
+user_contexts = defaultdict(lambda: deque(maxlen=20))
 
-class EmailIntent(BaseModel):
-    is_email: bool = Field(description="True only if user explicitly asks to write, send, compose, or draft an email/message to someone")
-    recipient_name: str = Field(default="", description="Name of recipient")
-    topic: str = Field(default="", description="Topic or purpose of the email")
+class UserIntent(BaseModel):
+    intent: str = Field(
+        default="chat",
+        description="'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'chat' for everything else"
+    )
+    is_email: bool = Field(default=False, description="True if intent == 'email'")
+    is_pdf: bool = Field(default=False, description="True if intent == 'pdf'")
+    recipient_name: str = Field(default="", description="Name of recipient if email")
+    topic: str = Field(default="", description="Topic of the email or detailed topic/instructions for the PDF")
     recipient_email: str = Field(default="", description="Email address if explicitly provided")
     sender_name: str = Field(default="", description="Sender name if specified")
+    pdf_filename: str = Field(default="document.pdf", description="Short English filename ending with .pdf, e.g. electrodynamics.pdf")
+
+EmailIntent = UserIntent
 
 class EmailDraft(BaseModel):
     subject: str = Field(description="Email subject line")
     body: str = Field(description="Email body text")
 
-async def parse_email_intent(text: str) -> EmailIntent:
-    """Определяет намерение написать email через структурированный вывод Gemini."""
-    cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=EmailIntent, temperature=0.1)
+async def parse_user_intent(text: str) -> UserIntent:
+    """Определяет намерение пользователя (email / pdf / обычный чат) через структурированный вывод Gemini."""
+    cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=UserIntent, temperature=0.1)
     res = await client.aio.models.generate_content(model=MODEL, contents=text, config=cfg)
     try:
-        return EmailIntent.model_validate_json(res.text or "{}")
+        data = UserIntent.model_validate_json(res.text or "{}")
+        if data.intent == "email": data.is_email = True
+        elif data.intent == "pdf": data.is_pdf = True
+        return data
     except Exception:
-        return EmailIntent(is_email=False)
+        return UserIntent(intent="chat")
+
+parse_email_intent = parse_user_intent
 
 async def generate_email_text(topic: str, recipient: str, sendername: str) -> tuple[str, str]:
     """Генерирует тему и текст письма через Gemini."""
@@ -44,7 +58,7 @@ async def generate_email_text(topic: str, recipient: str, sendername: str) -> tu
         return topic[:50] or "Без темы", res.text or ""
 
 async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
-    """Асинхронный диалог с моделью с изолированной историей на каждого пользователя."""
+    """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений) на каждого пользователя."""
     hist = user_contexts[user_id]
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=chat_text)]))
     cfg = types.GenerateContentConfig(
@@ -56,7 +70,7 @@ async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
     hist.append(types.Content(role="model", parts=[types.Part.from_text(text=reply)]))
     return reply
 
-ask_gpt = ask_gemini  # обратная совместимость
+ask_gpt = ask_gemini
 
 async def transcribe_voice(voice_bytes: bytes) -> str:
     """Транскрибирует голосовое сообщение через Gemini аудио-модель."""
@@ -67,11 +81,87 @@ async def transcribe_voice(voice_bytes: bytes) -> str:
     )
     return (res.text or "").strip()
 
-async def process_telegram_image(message, user_prompt: str) -> str:
-    """Обработка изображений через мультимодальный Gemini."""
-    image_bytes = await message.download_media(file=bytes)
-    if not image_bytes:
-        return "Не удалось загрузить изображение."
-    part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-    res = await client.aio.models.generate_content(model=MODEL, contents=[part, user_prompt or "Опиши это изображение"])
-    return (res.text or "Ответ пуст.").strip()
+async def process_telegram_images(messages, user_prompt: str, user_id: int | None = None) -> str:
+    """Обработка от 1 до 10 изображений одновременно через мультимодальный Gemini с сохранением в контекст."""
+    msg_list = messages if isinstance(messages, list) else [messages]
+    raw_images = await asyncio.gather(*(m.download_media(file=bytes) for m in msg_list[:10]))
+    parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in raw_images if b]
+    if not parts:
+        return "Не удалось загрузить изображения."
+    prompt_txt = user_prompt or "Опиши и проанализируй эти изображения"
+    parts.append(types.Part.from_text(text=prompt_txt))
+
+    hist = user_contexts[user_id]
+    cfg = types.GenerateContentConfig(
+        system_instruction="Ты персональный ассистент Кристина. Проанализируй все переданные изображения и ответь на запрос пользователя.",
+        temperature=0.7
+    )
+    res = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=[*list(hist), types.Content(role="user", parts=parts)],
+        config=cfg
+    )
+    reply = (res.text or "Ответ пуст.").strip()
+    hist.append(types.Content(role="user", parts=[types.Part.from_text(text=f"[Фото: {len(parts)-1} шт.] {prompt_txt}")]))
+    hist.append(types.Content(role="model", parts=[types.Part.from_text(text=reply)]))
+    return reply
+
+process_telegram_image = process_telegram_images
+
+LATEX_SYSTEM_PROMPT = r"""You are an expert LaTeX typesetter. Generate a complete, well-structured, valid LaTeX document for xelatex based on the user request.
+STRICT RULES:
+1. Output ONLY raw LaTeX code starting with \documentclass[12pt,a4paper]{article} and ending with \end{document}. No markdown fences, no explanations.
+2. Always use this exact preamble:
+\documentclass[12pt,a4paper]{article}
+\usepackage{fontspec}
+\setmainfont{CMU Serif}
+\setsansfont{CMU Sans Serif}
+\setmonofont{CMU Typewriter Text}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{geometry}
+\geometry{margin=2cm}
+3. Do NOT use inputenc, fontenc, babel, external images (\includegraphics), tikz, or tcolorbox.
+4. Make sure every \begin{...} matches its exact \end{...}.
+5. Escape %, &, #, _ in plain text outside math mode ($...$).
+6. Write the document content in the SAME language as the user's request (e.g. Russian if requested in Russian)."""
+
+def _clean_latex(raw: str) -> str:
+    tex = re.sub(r"^```(?:latex|tex)?\s*", "", raw.strip())
+    tex = re.sub(r"\s*```$", "", tex).strip()
+    if "\\documentclass" in tex:
+        tex = tex[tex.index("\\documentclass"):]
+    if "\\end{document}" in tex:
+        tex = tex[:tex.rindex("\\end{document}") + len("\\end{document}")]
+    return "\\nonstopmode\n" + tex
+
+def _compile_xelatex_sync(tex_code: str) -> tuple[bool, bytes | str]:
+    r = requests.post(
+        "https://latex.ytotech.com/builds/sync",
+        json={"compiler": "xelatex", "resources": [{"main": True, "content": tex_code}]},
+        timeout=60
+    )
+    if r.status_code in (200, 201) and "application/pdf" in r.headers.get("Content-Type", ""):
+        return True, r.content
+    return False, r.text[:1500]
+
+async def generate_pdf_from_prompt(prompt: str, user_id: int | None = None) -> bytes:
+    """Генерирует LaTeX-код по запросу пользователя и компилирует его в готовый PDF-файл."""
+    hist = list(user_contexts[user_id]) if user_id is not None else []
+    cfg = types.GenerateContentConfig(system_instruction=LATEX_SYSTEM_PROMPT, temperature=0.3)
+    contents = [*hist, types.Content(role="user", parts=[types.Part.from_text(text=f"Сгенерируй полный LaTeX документ по запросу: {prompt}")])]
+    res = await client.aio.models.generate_content(model=MODEL, contents=contents, config=cfg)
+    tex = _clean_latex(res.text or "")
+
+    ok, result = await asyncio.to_thread(_compile_xelatex_sync, tex)
+    if not ok:
+        fix_prompt = f"Исправь ошибки компиляции XeLaTeX и верни ТОЛЬКО исправленный код LaTeX:\nОшибка:\n{result}\n\nКод:\n{tex}"
+        res_fix = await client.aio.models.generate_content(model=MODEL, contents=fix_prompt, config=cfg)
+        tex = _clean_latex(res_fix.text or "")
+        ok, result = await asyncio.to_thread(_compile_xelatex_sync, tex)
+        if not ok:
+            raise RuntimeError(f"Ошибка компиляции LaTeX: {result[:300]}")
+
+    if user_id is not None:
+        user_contexts[user_id].append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+        user_contexts[user_id].append(types.Content(role="model", parts=[types.Part.from_text(text=f"[Сгенерирован PDF документ по теме: {prompt}]")]))
+    return result
