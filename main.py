@@ -185,7 +185,7 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         await run_portal_check(event)
         return True
     if intent.is_pdf:
-        status = await event.reply("📄 Генерирую LaTeX-код и собираю PDF-файл, подожди пару секунд...")
+        status = await event.reply("📄 Генерирую PDF-файл, подожди пару секунд...")
         try:
             pdf_bytes = await generate_pdf_from_prompt(text, user_id=user_id)
             fname = (intent.pdf_filename or "document.pdf").strip()
@@ -254,13 +254,12 @@ async def startup_event():
             scope=types.BotCommandScopeDefault(),
             lang_code="",
             commands=[
-                types.BotCommand("help", "Все возможности и команды бота"),
-                types.BotCommand("checkportal", "Проверить объявления портала DGIST"),
-                types.BotCommand("connectmyportal", "Подключить аккаунт DGIST"),
-                types.BotCommand("disconnectportal", "Удалить данные портала DGIST"),
-                types.BotCommand("connectgmail", "Подключить Gmail для писем"),
-                types.BotCommand("sendshak", "Отправить сообщение (!username/текст)"),
-                types.BotCommand("cancel", "Отменить текущее действие"),
+                types.BotCommand("help", "Все возможности и команды"),
+                types.BotCommand("checkportal", "Проверить объявления DGIST"),
+                types.BotCommand("connectmyportal", "Подключить портал DGIST"),
+                types.BotCommand("disconnectportal", "Отключить портал DGIST"),
+                types.BotCommand("connectgmail", "Подключить Gmail"),
+                types.BotCommand("cancel", "Отменить действие"),
             ]
         ))
     except Exception as e:
@@ -310,29 +309,28 @@ async def update_draft(data: EditDraftModel):
     await apply_draft_update(data.draft_id, data.new_text, uid, data.message_id)
     return {"status": "success"}
 
-HELP_TEXT = """🤖 **Кристина — возможности и команды бота**
+HELP_TEXT = """🤖 **Что умеет Кристина:**
 
-📌 **Основные команды:**
-• /help — показать это меню помощи
-• /checkportal — проверить новые объявления на портале DGIST
-• /connectmyportal — подключить свой аккаунт портала DGIST (в ЛС)
-• /disconnectportal — удалить сохранённые данные портала DGIST
-• /connectgmail — подключить Gmail для создания и отправки писем
-• /sendShak — отправить сообщение в Telegram по формату `!username/текст`
-• /cancel — отменить текущий ввод или действие
+📌 **Команды:**
+• /help — список возможностей
+• /checkportal — проверить объявления DGIST
+• /connectmyportal — подключить портал DGIST (в ЛС)
+• /disconnectportal — отключить портал DGIST
+• /connectgmail — подключить Gmail
+• /cancel — отменить текущее действие
 
-✨ **Умные возможности (вызываются обычным текстом или голосом):**
-• 💬 **AI-чат (Google Gemini):** просто напиши любой вопрос (бот помнит контекст последних 10 сообщений). В группе — тегни бота через `@` или напиши *«Кристина, ...»*.
-• 🎓 **Проверка портала текстом:** можно не вводить команду, а просто написать *«чекни портал»* или *«что нового на портале»* (плюс бот сам проверяет портал каждые 33 часа).
-• 📄 **Генерация PDF с формулами (LaTeX):** напиши *«Сделай мне пдф по электродинамике»* (или любой другой теме) — бот сам сгенерирует LaTeX-код, скомпилирует его и скинет готовый `.pdf` файл в чат.
-• 📸 **Анализ до 10 фото сразу:** отправь от 1 до 10 картинок (альбомом сразу с подписью-запросом или сначала фото, а следом промпт) — бот проанализирует все изображения вместе.
-• 🎙 **Голосовые сообщения:** отправь войс — бот расшифрует речь и выполнит задачу (ответит, сделает PDF или подготовит email).
-• 📧 **Авто-черновики Gmail:** напиши *«Напиши письмо профессору Киму о встрече»* — бот найдёт адрес в твоей почте, создаст черновик и даст кнопки `✅ Отправить`, `✏️ Изменить текст`, `❌ Отмена`."""
+✨ **Возможности (просто напиши или скажи голосом):**
+• 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
+• 🎓 **Объявления DGIST** — напиши *«чекни портал»* или *«что нового на портале»*, и я пришлю свежие новости.
+• 📄 **Создание PDF-файлов** — напиши, например, *«Сделай мне пдф по электродинамике»*, и я сгенерирую готовый PDF по нужной теме.
+• 📸 **Работа с фото (до 10 штук)** — отправь от 1 до 10 картинок с вопросом, и я разберу их все сразу.
+• 🎙 **Голосовые сообщения** — отправь войс, и я отвечу на вопрос, сделаю PDF или подготовлю письмо.
+• 📧 **Отправка Email** — напиши *«Напиши письмо профессору Киму о встрече»*, и я создам готовый черновик с кнопками отправки и редактирования."""
 
 @client.on(events.NewMessage(pattern=r'^/start(@\w+)?(\s|$)'))
 async def start_msg(e):
     remember_group_topic(e)
-    await e.reply('Привет! Я Кристина — твой личный AI-ассистент на базе Google Gemini.\nНажми /help, чтобы узнать все мои команды и возможности!')
+    await e.reply('Привет! Я Кристина — твой личный ассистент.\nНажми /help, чтобы посмотреть все мои команды и возможности!')
 
 @client.on(events.NewMessage(pattern=r'^/help(@\w+)?(\s|$)'))
 async def help_msg(e):
