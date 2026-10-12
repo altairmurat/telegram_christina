@@ -1,4 +1,4 @@
-import asyncio, os, sys, subprocess, traceback
+import asyncio, json, os, sys, subprocess, traceback
 from telethon import events
 import dgist_monitor
 from dgist_accounts import save_dgist_account, load_dgist_account, delete_dgist_account, list_dgist_user_ids
@@ -6,50 +6,95 @@ from dgist_accounts import save_dgist_account, load_dgist_account, delete_dgist_
 _active_portal_checks = set()
 AUTO_CHECK_INTERVAL_SEC = 33 * 60 * 60
 _auto_monitor_task = None
+GROUP_TARGET_FILE = os.path.join("user_data", "group_target.json")
+
+def get_topic_id(event) -> int | None:
+    r = getattr(event.message, "reply_to", None)
+    if r and getattr(r, "forum_topic", False):
+        return getattr(r, "reply_to_top_id", None) or getattr(r, "reply_to_msg_id", None)
+    return None
+
+def remember_group_topic(event):
+    if event.is_private:
+        return
+    tid = get_topic_id(event)
+    os.makedirs("user_data", exist_ok=True)
+    try:
+        with open(GROUP_TARGET_FILE, "w", encoding="utf-8") as f:
+            json.dump({"chat_id": event.chat_id, "topic_id": tid}, f)
+    except Exception:
+        pass
+
+def load_group_target() -> dict | None:
+    if not os.path.exists(GROUP_TARGET_FILE):
+        return None
+    try:
+        with open(GROUP_TARGET_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def is_active_group_topic(event) -> bool:
+    if event.is_private:
+        return False
+    tid = get_topic_id(event)
+    if not tid:
+        return False
+    target = load_group_target()
+    return bool(target and target.get("chat_id") == event.chat_id and target.get("topic_id") == tid)
+
+async def run_portal_check(e):
+    remember_group_topic(e)
+    uid = e.sender_id
+    acc = await asyncio.to_thread(load_dgist_account, uid)
+    if not acc:
+        all_uids = await asyncio.to_thread(list_dgist_user_ids)
+        if all_uids:
+            uid = all_uids[0]
+            acc = await asyncio.to_thread(load_dgist_account, uid)
+    if not acc:
+        return await e.reply("Портал ещё не подключён. Сначала: /connectmyportal")
+    if uid in _active_portal_checks:
+        return await e.reply("Уже идёт проверка портала, подожди немного...")
+
+    _active_portal_checks.add(uid)
+    status_msg = await e.reply("🔄 Проверяю DGIST...")
+    try:
+        res = await _check_user_portal(uid, acc)
+        if res.get("error"):
+            await status_msg.edit(f"❌ Ошибка проверки:\n{res['error']}")
+        else:
+            msgs = _format_new_posts_messages(res)
+            for idx, m in enumerate(msgs):
+                if idx == 0: await status_msg.edit(m)
+                else: await e.reply(m)
+    except Exception as ex:
+        await status_msg.edit(f"❌ Не удалось проверить портал: {ex}")
+    finally:
+        _active_portal_checks.discard(uid)
 
 def register_dgist_handlers(client, user_states: dict):
     global _auto_monitor_task
 
-    @client.on(events.NewMessage(pattern='/connectmyportal'))
+    @client.on(events.NewMessage(pattern=r'^/connectmyportal(@\w+)?(\s|$)'))
     async def connect_portal(e):
         user_states[e.sender_id] = "waiting_for_dgist_username"
-        await e.respond("🎓 **Подключение DGIST портала** (1/4)\n\nВведи свой логин от портала:")
+        await e.reply("🎓 **Подключение DGIST портала** (1/4)\n\nВведи свой логин от портала:")
 
-    @client.on(events.NewMessage(pattern='/disconnectportal'))
+    @client.on(events.NewMessage(pattern=r'^/disconnectportal(@\w+)?(\s|$)'))
     async def disconnect_portal(e):
         await asyncio.to_thread(delete_dgist_account, e.sender_id)
         user_states.pop(e.sender_id, None)
-        await e.respond("🗑 Данные портала удалены.")
+        await e.reply("🗑 Данные портала удалены.")
 
-    @client.on(events.NewMessage(pattern='/cancel'))
+    @client.on(events.NewMessage(pattern=r'^/cancel(@\w+)?(\s|$)'))
     async def cancel_flow(e):
         user_states.pop(e.sender_id, None)
-        await e.respond("Ок, отменил текущий диалог.")
+        await e.reply("Ок, отменил текущий диалог.")
 
-    @client.on(events.NewMessage(pattern='/checkportal'))
+    @client.on(events.NewMessage(pattern=r'^/checkportal(@\w+)?(\s|$)'))
     async def check_portal(e):
-        uid = e.sender_id
-        acc = await asyncio.to_thread(load_dgist_account, uid)
-        if not acc:
-            return await e.respond("Портал ещё не подключён. Сначала: /connectmyportal")
-        if uid in _active_portal_checks:
-            return await e.respond("Уже идёт проверка портала, подожди немного...")
-
-        _active_portal_checks.add(uid)
-        status_msg = await e.respond("🔄 Проверяю DGIST...")
-        try:
-            res = await _check_user_portal(uid, acc)
-            if res.get("error"):
-                await status_msg.edit(f"❌ Ошибка проверки:\n{res['error']}")
-            else:
-                msgs = _format_new_posts_messages(res)
-                for idx, m in enumerate(msgs):
-                    if idx == 0: await status_msg.edit(m)
-                    else: await e.respond(m)
-        except Exception as ex:
-            await status_msg.edit(f"❌ Не удалось проверить портал: {ex}")
-        finally:
-            _active_portal_checks.discard(uid)
+        await run_portal_check(e)
 
     if _auto_monitor_task is None or _auto_monitor_task.done():
         _auto_monitor_task = asyncio.create_task(_auto_monitor_loop(client))
@@ -112,8 +157,13 @@ async def _auto_monitor_loop(client):
                     if not is_first and not res.get("error"):
                         posts = list(res.get("new_important", [])) + list(res.get("new_minor", []))
                         if posts:
-                            for m in _format_new_posts_messages(res):
+                            formatted = _format_new_posts_messages(res)
+                            for m in formatted:
                                 await client.send_message(uid, m, link_preview=False)
+                            gt = load_group_target()
+                            if gt and gt.get("chat_id") and gt.get("chat_id") != uid:
+                                for m in formatted:
+                                    await client.send_message(gt["chat_id"], m, reply_to=gt.get("topic_id"), link_preview=False)
                 except Exception as ex:
                     print(f"[AUTO] Ошибка user={uid}: {ex}")
                 finally:
@@ -144,7 +194,7 @@ async def handle_dgist_conversation_step(event, uid: int, state, user_states: di
     if state == "waiting_for_dgist_username":
         if not txt: return await event.reply("Логин не может быть пустым.")
         user_states[uid] = ("waiting_for_dgist_password", txt)
-        await event.respond("🎓 **Подключение DGIST** (2/4)\nВведи пароль от портала (сообщение удалю):")
+        await event.reply("🎓 **Подключение DGIST** (2/4)\nВведи пароль от портала (сообщение удалю):")
         return True
 
     if isinstance(state, tuple) and state[0] == "waiting_for_dgist_password":
@@ -152,13 +202,13 @@ async def handle_dgist_conversation_step(event, uid: int, state, user_states: di
         except Exception: pass
         if not txt: return await event.reply("Пароль не может быть пустым.")
         user_states[uid] = ("waiting_for_dgist_email", state[1], txt)
-        await event.respond("🎓 **Подключение DGIST** (3/4)\nВведи email, куда приходит 2FA код:")
+        await event.reply("🎓 **Подключение DGIST** (3/4)\nВведи email, куда приходит 2FA код:")
         return True
 
     if isinstance(state, tuple) and state[0] == "waiting_for_dgist_email":
         if "@" not in txt: return await event.reply("Это не похоже на email. Попробуй ещё раз:")
         user_states[uid] = ("waiting_for_dgist_email_app_password", state[1], state[2], txt)
-        await event.respond("🎓 **Подключение DGIST** (4/4)\nВведи App Password от почты (сообщение удалю):")
+        await event.reply("🎓 **Подключение DGIST** (4/4)\nВведи App Password от почты (сообщение удалю):")
         return True
 
     if isinstance(state, tuple) and state[0] == "waiting_for_dgist_email_app_password":
@@ -169,10 +219,10 @@ async def handle_dgist_conversation_step(event, uid: int, state, user_states: di
         try:
             await asyncio.to_thread(save_dgist_account, uid, u, p, em, txt)
             user_states.pop(uid, None)
-            await event.respond("✅ **Портал успешно подключён!** Пароли зашифрованы.\n\nКоманда /checkportal проверяет объявления.")
+            await event.reply("✅ **Портал успешно подключён!** Пароли зашифрованы.\n\nКоманда /checkportal проверяет объявления.")
         except Exception as ex:
             user_states.pop(uid, None)
-            await event.respond(f"❌ Ошибка сохранения: {ex}\nПопробуй запустить /connectmyportal снова.")
+            await event.reply(f"❌ Ошибка сохранения: {ex}\nПопробуй запустить /connectmyportal снова.")
         return True
 
     return False

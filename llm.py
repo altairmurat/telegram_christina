@@ -16,10 +16,11 @@ user_contexts = defaultdict(lambda: deque(maxlen=20))
 class UserIntent(BaseModel):
     intent: str = Field(
         default="chat",
-        description="'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'chat' for everything else"
+        description="'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'chat' for everything else"
     )
     is_email: bool = Field(default=False, description="True if intent == 'email'")
     is_pdf: bool = Field(default=False, description="True if intent == 'pdf'")
+    is_portal: bool = Field(default=False, description="True if intent == 'portal'")
     recipient_name: str = Field(default="", description="Name of recipient if email")
     topic: str = Field(default="", description="Topic of the email or detailed topic/instructions for the PDF")
     recipient_email: str = Field(default="", description="Email address if explicitly provided")
@@ -33,13 +34,14 @@ class EmailDraft(BaseModel):
     body: str = Field(description="Email body text")
 
 async def parse_user_intent(text: str) -> UserIntent:
-    """Определяет намерение пользователя (email / pdf / обычный чат) через структурированный вывод Gemini."""
+    """Определяет намерение пользователя (email / pdf / portal / обычный чат) через структурированный вывод Gemini."""
     cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=UserIntent, temperature=0.1)
     res = await client.aio.models.generate_content(model=MODEL, contents=text, config=cfg)
     try:
         data = UserIntent.model_validate_json(res.text or "{}")
         if data.intent == "email": data.is_email = True
         elif data.intent == "pdf": data.is_pdf = True
+        elif data.intent == "portal": data.is_portal = True
         return data
     except Exception:
         return UserIntent(intent="chat")

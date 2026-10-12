@@ -18,7 +18,10 @@ from llm import (
     ask_gemini, transcribe_voice, process_telegram_images,
     parse_user_intent, generate_email_text, generate_pdf_from_prompt
 )
-from dgist_bot_handlers import register_dgist_handlers, handle_dgist_conversation_step
+from dgist_bot_handlers import (
+    register_dgist_handlers, handle_dgist_conversation_step,
+    run_portal_check, remember_group_topic, is_active_group_topic
+)
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 app = FastAPI()
@@ -178,6 +181,9 @@ async def send_draft_to_telegram(event, gmail, user_id: int, to: str, name: str,
 
 async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     intent = await parse_user_intent(text)
+    if intent.is_portal:
+        await run_portal_check(event)
+        return True
     if intent.is_pdf:
         status = await event.reply("📄 Генерирую LaTeX-код и собираю PDF-файл, подожди пару секунд...")
         try:
@@ -288,25 +294,41 @@ async def update_draft(data: EditDraftModel):
     await apply_draft_update(data.draft_id, data.new_text, uid, data.message_id)
     return {"status": "success"}
 
-@client.on(events.NewMessage(pattern='/start'))
+@client.on(events.NewMessage(pattern=r'^/start(@\w+)?(\s|$)'))
 async def start_msg(e):
-    await e.respond('Привет! Я Кристина — твой личный ассистент на базе Google Gemini. Помогаю писать email, работать с фото/голосом и отслеживать портал DGIST!')
+    remember_group_topic(e)
+    await e.reply('Привет! Я Кристина — твой личный ассистент на базе Google Gemini. Помогаю писать email, работать с фото/голосом, генерировать PDF и отслеживать портал DGIST!')
 
-@client.on(events.NewMessage(pattern=r'^/(connectgmail|reconnect)'))
+@client.on(events.NewMessage(pattern=r'^/(connectgmail|reconnect)(@\w+)?(\s|$)'))
 async def connect_gmail(e):
     delete_user_token(e.sender_id)
-    await e.respond(f"⚠️ **Подключение Gmail**\n\nАвторизуйся по ссылке:\n{build_auth_url(e.sender_id)}")
+    await e.reply(f"⚠️ **Подключение Gmail**\n\nАвторизуйся по ссылке:\n{build_auth_url(e.sender_id)}")
 
-@client.on(events.NewMessage(pattern='/sendShak'))
+@client.on(events.NewMessage(pattern=r'^/sendShak(@\w+)?(\s|$)'))
 async def send_shak(e):
     user_states[e.sender_id] = "waiting_for_submitmessage"
-    await e.respond('Напиши сообщение в формате: `!username/текст`')
+    await e.reply('Напиши сообщение в формате: `!username/текст`')
 
 @client.on(events.NewMessage)
 async def necessary_task_handler(event):
-    if not event.is_private or (event.text and event.text.startswith("/")): return
+    if event.text and event.text.startswith("/"): return
     uid, sender = event.sender_id, await event.get_sender()
     state = user_states.get(uid)
+
+    if not event.is_private:
+        raw_l = (event.raw_text or "").lower()
+        mentioned = bool(
+            event.mentioned or "@" in raw_l or "кристин" in raw_l
+            or "christin" in raw_l or "портал" in raw_l or "portal" in raw_l
+        )
+        if mentioned:
+            remember_group_topic(event)
+        elif state is None and not is_active_group_topic(event):
+            if event.is_reply:
+                rmsg = await event.get_reply_message()
+                if not (rmsg and rmsg.out): return
+            else:
+                return
 
     if await handle_dgist_conversation_step(event, uid, state, user_states): return
 
@@ -351,7 +373,7 @@ async def necessary_task_handler(event):
             if txt:
                 if not await try_handle_email_intent(event, uid, txt):
                     ans = await ask_gemini(txt, user_id=uid)
-                    await event.respond(ans)
+                    await event.reply(ans)
                     await asyncio.to_thread(save_communication, sender.username if sender else None, txt)
             else: await event.reply("Не удалось распознать речь.")
         except Exception as ex: await event.reply(f"Ошибка аудио: {ex}")
@@ -367,7 +389,7 @@ async def necessary_task_handler(event):
         if len(pending_photos[uid]) < 10:
             pending_photos[uid].append(event.message)
         if event.raw_text and event.raw_text.strip():
-            pending_captions[uid] = event.raw_text.strip()
+            pending_captions[uid] = re.sub(r"@\w+", "", event.raw_text).strip() or event.raw_text.strip()
 
         async def _flush_photos(u=uid, ev=event):
             await asyncio.sleep(0.8)
@@ -384,7 +406,7 @@ async def necessary_task_handler(event):
                         await st.edit(f"❌ Ошибка: {ex}")
             else:
                 user_states[u] = "waiting_for_imageprompt"
-                await ev.respond(f"📸 Получила фото ({len(pending_photos[u])}/10 шт.)! Что с ними сделать?")
+                await ev.reply(f"📸 Получила фото ({len(pending_photos[u])}/10 шт.)! Что с ними сделать?")
 
         photo_tasks[uid] = asyncio.create_task(_flush_photos())
 
@@ -396,17 +418,19 @@ async def necessary_task_handler(event):
         pending_captions.pop(uid, None)
         user_states.pop(uid, None)
         if msgs:
+            clean_txt = re.sub(r"@\w+", "", event.text).strip() or event.text
             st = await event.reply(f"⏳ Обрабатываю фото ({len(msgs)} шт.)...")
             try:
-                ans = await process_telegram_images(msgs, event.text, user_id=uid)
+                ans = await process_telegram_images(msgs, clean_txt, user_id=uid)
                 await st.edit(ans)
             except Exception as ex:
                 await st.edit(f"❌ Ошибка: {ex}")
 
     elif event.text:
+        clean_txt = re.sub(r"@\w+", "", event.text).strip() or event.text
         try:
-            if not await try_handle_email_intent(event, uid, event.text):
-                ans = await ask_gemini(event.text, user_id=uid)
-                await event.respond(ans)
-                await asyncio.to_thread(save_communication, sender.username if sender else None, event.text)
-        except Exception as ex: await event.respond(f"Ошибка: {ex}")
+            if not await try_handle_email_intent(event, uid, clean_txt):
+                ans = await ask_gemini(clean_txt, user_id=uid)
+                await event.reply(ans)
+                await asyncio.to_thread(save_communication, sender.username if sender else None, clean_txt)
+        except Exception as ex: await event.reply(f"Ошибка: {ex}")
