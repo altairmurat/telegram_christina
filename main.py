@@ -9,7 +9,7 @@ from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from telethon import TelegramClient, events, Button, types
+from telethon import TelegramClient, events, Button, types, functions
 
 from env import API_ID, API_HASH, BOT_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI, WEBAPP_URL
 from database import SessionLocal, engine
@@ -249,6 +249,22 @@ async def startup_event():
     except Exception as e: print(f"DB init error: {e}")
     await client.start(bot_token=BOT_TOKEN)
     register_dgist_handlers(client, user_states)
+    try:
+        await client(functions.bots.SetBotCommandsRequest(
+            scope=types.BotCommandScopeDefault(),
+            lang_code="",
+            commands=[
+                types.BotCommand("help", "Все возможности и команды бота"),
+                types.BotCommand("checkportal", "Проверить объявления портала DGIST"),
+                types.BotCommand("connectmyportal", "Подключить аккаунт DGIST"),
+                types.BotCommand("disconnectportal", "Удалить данные портала DGIST"),
+                types.BotCommand("connectgmail", "Подключить Gmail для писем"),
+                types.BotCommand("sendshak", "Отправить сообщение (!username/текст)"),
+                types.BotCommand("cancel", "Отменить текущее действие"),
+            ]
+        ))
+    except Exception as e:
+        print(f"Set commands error: {e}")
     asyncio.create_task(client.run_until_disconnected())
 
 @app.on_event("shutdown")
@@ -294,17 +310,41 @@ async def update_draft(data: EditDraftModel):
     await apply_draft_update(data.draft_id, data.new_text, uid, data.message_id)
     return {"status": "success"}
 
+HELP_TEXT = """🤖 **Кристина — возможности и команды бота**
+
+📌 **Основные команды:**
+• /help — показать это меню помощи
+• /checkportal — проверить новые объявления на портале DGIST
+• /connectmyportal — подключить свой аккаунт портала DGIST (в ЛС)
+• /disconnectportal — удалить сохранённые данные портала DGIST
+• /connectgmail — подключить Gmail для создания и отправки писем
+• /sendShak — отправить сообщение в Telegram по формату `!username/текст`
+• /cancel — отменить текущий ввод или действие
+
+✨ **Умные возможности (вызываются обычным текстом или голосом):**
+• 💬 **AI-чат (Google Gemini):** просто напиши любой вопрос (бот помнит контекст последних 10 сообщений). В группе — тегни бота через `@` или напиши *«Кристина, ...»*.
+• 🎓 **Проверка портала текстом:** можно не вводить команду, а просто написать *«чекни портал»* или *«что нового на портале»* (плюс бот сам проверяет портал каждые 33 часа).
+• 📄 **Генерация PDF с формулами (LaTeX):** напиши *«Сделай мне пдф по электродинамике»* (или любой другой теме) — бот сам сгенерирует LaTeX-код, скомпилирует его и скинет готовый `.pdf` файл в чат.
+• 📸 **Анализ до 10 фото сразу:** отправь от 1 до 10 картинок (альбомом сразу с подписью-запросом или сначала фото, а следом промпт) — бот проанализирует все изображения вместе.
+• 🎙 **Голосовые сообщения:** отправь войс — бот расшифрует речь и выполнит задачу (ответит, сделает PDF или подготовит email).
+• 📧 **Авто-черновики Gmail:** напиши *«Напиши письмо профессору Киму о встрече»* — бот найдёт адрес в твоей почте, создаст черновик и даст кнопки `✅ Отправить`, `✏️ Изменить текст`, `❌ Отмена`."""
+
 @client.on(events.NewMessage(pattern=r'^/start(@\w+)?(\s|$)'))
 async def start_msg(e):
     remember_group_topic(e)
-    await e.reply('Привет! Я Кристина — твой личный ассистент на базе Google Gemini. Помогаю писать email, работать с фото/голосом, генерировать PDF и отслеживать портал DGIST!')
+    await e.reply('Привет! Я Кристина — твой личный AI-ассистент на базе Google Gemini.\nНажми /help, чтобы узнать все мои команды и возможности!')
+
+@client.on(events.NewMessage(pattern=r'^/help(@\w+)?(\s|$)'))
+async def help_msg(e):
+    remember_group_topic(e)
+    await e.reply(HELP_TEXT)
 
 @client.on(events.NewMessage(pattern=r'^/(connectgmail|reconnect)(@\w+)?(\s|$)'))
 async def connect_gmail(e):
     delete_user_token(e.sender_id)
     await e.reply(f"⚠️ **Подключение Gmail**\n\nАвторизуйся по ссылке:\n{build_auth_url(e.sender_id)}")
 
-@client.on(events.NewMessage(pattern=r'^/sendShak(@\w+)?(\s|$)'))
+@client.on(events.NewMessage(pattern=r'(?i)^/sendShak(@\w+)?(\s|$)'))
 async def send_shak(e):
     user_states[e.sender_id] = "waiting_for_submitmessage"
     await e.reply('Напиши сообщение в формате: `!username/текст`')
