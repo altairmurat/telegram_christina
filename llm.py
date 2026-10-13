@@ -16,11 +16,14 @@ user_contexts = defaultdict(lambda: deque(maxlen=20))
 class UserIntent(BaseModel):
     intent: str = Field(
         default="chat",
-        description="'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'chat' for everything else"
+        description="'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; 'chat' for everything else"
     )
     is_email: bool = Field(default=False, description="True if intent == 'email'")
     is_pdf: bool = Field(default=False, description="True if intent == 'pdf'")
     is_portal: bool = Field(default=False, description="True if intent == 'portal'")
+    is_group_query: bool = Field(default=False, description="True if intent == 'group_query' or user asks about group messages/topics")
+    group_topic_name: str = Field(default="", description="Name or title of the group topic if mentioned (e.g. 'important announcements', 'homework', 'general')")
+    group_search_query: str = Field(default="", description="Key terms or topic to search within group messages")
     recipient_name: str = Field(default="", description="Name of recipient if email")
     topic: str = Field(default="", description="Topic of the email or detailed topic/instructions for the PDF")
     recipient_email: str = Field(default="", description="Email address if explicitly provided")
@@ -34,7 +37,7 @@ class EmailDraft(BaseModel):
     body: str = Field(description="Email body text")
 
 async def parse_user_intent(text: str) -> UserIntent:
-    """Определяет намерение пользователя (email / pdf / portal / обычный чат) через структурированный вывод Gemini."""
+    """Определяет намерение пользователя (email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
     cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=UserIntent, temperature=0.1)
     res = await client.aio.models.generate_content(model=MODEL, contents=text, config=cfg)
     try:
@@ -42,9 +45,35 @@ async def parse_user_intent(text: str) -> UserIntent:
         if data.intent == "email": data.is_email = True
         elif data.intent == "pdf": data.is_pdf = True
         elif data.intent == "portal": data.is_portal = True
+        elif data.intent == "group_query": data.is_group_query = True
         return data
     except Exception:
         return UserIntent(intent="chat")
+
+async def answer_with_group_context(user_query: str, group_context_text: str, user_id: int | None = None) -> str:
+    """Генерирует ответ пользователю на основе сообщений из группы."""
+    hist = user_contexts[user_id]
+    prompt = f"""Ниже приведены реальные сообщения из топиков Telegram-группы:
+---
+{group_context_text}
+---
+
+Вопрос пользователя: {user_query}
+
+Инструкция:
+1. Ответь пользователю чётко и прямо по существу, используя факты из сообщений выше.
+2. Укажи автора, дату или топик, если это полезно.
+3. Если информации недостаточно или в этих сообщениях её нет, прямо и честно скажи об этом."""
+
+    hist.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+    cfg = types.GenerateContentConfig(
+        system_instruction="Ты персональный ассистент Кристина. Ты помогаешь ориентироваться в сообщениях и топиках группы Telegram. Отвечай кратко, понятно и дружелюбно.",
+        temperature=0.4
+    )
+    res = await client.aio.models.generate_content(model=MODEL, contents=list(hist), config=cfg)
+    reply = (res.text or "").strip()
+    hist.append(types.Content(role="model", parts=[types.Part.from_text(text=reply)]))
+    return reply
 
 parse_email_intent = parse_user_intent
 

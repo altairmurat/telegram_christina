@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, Float, String, ForeignKey, Text, BigInteger
+from sqlalchemy import Column, Integer, Float, String, ForeignKey, Text, BigInteger, DateTime
+import datetime
 from database import Base
 
 class User(Base):
@@ -43,3 +44,26 @@ class DgistAccount(Base):
     email_address = Column(String)                # почта, куда приходит код — не секрет
     email_app_password_enc = Column(Text)          # ЗАШИФРОВАНО
     email_imap_host = Column(String, default="imap.gmail.com")
+
+class GroupTopic(Base):
+    __tablename__ = "group_topics"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, index=True)
+    topic_id = Column(Integer, index=True)
+    topic_title = Column(String)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class GroupMessage(Base):
+    __tablename__ = "group_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(BigInteger, index=True)
+    chat_id = Column(BigInteger, index=True)
+    topic_id = Column(Integer, index=True, nullable=True)
+    topic_title = Column(String, nullable=True)
+    sender_id = Column(BigInteger, nullable=True)
+    sender_name = Column(String, nullable=True)
+    text = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+

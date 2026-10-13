@@ -16,11 +16,16 @@ from database import SessionLocal, engine
 import models
 from llm import (
     ask_gemini, transcribe_voice, process_telegram_images,
-    parse_user_intent, generate_email_text, generate_pdf_from_prompt
+    parse_user_intent, generate_email_text, generate_pdf_from_prompt,
+    answer_with_group_context
 )
 from dgist_bot_handlers import (
     register_dgist_handlers, handle_dgist_conversation_step,
     run_portal_check, remember_group_topic, is_active_group_topic
+)
+from group_memory import (
+    record_group_message, search_group_messages, list_known_topics,
+    format_messages_for_prompt, get_default_chat_id
 )
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -184,10 +189,51 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     if intent.is_portal:
         await run_portal_check(event)
         return True
+
+    if intent.is_group_query:
+        cid = event.chat_id if not event.is_private else get_default_chat_id()
+        msgs = search_group_messages(
+            query=intent.group_search_query or text,
+            topic_name=intent.group_topic_name,
+            chat_id=cid,
+            limit=30
+        )
+        if not msgs and intent.group_topic_name:
+            # Если по конкретному названию не нашлось, берем последние сообщения группы
+            msgs = search_group_messages(chat_id=cid, limit=25)
+
+        if not msgs:
+            known = list_known_topics(cid)
+            if not known:
+                await event.reply(
+                    "🔍 Я пока не сохранила сообщений из группы.\n\n"
+                    "Чтобы я могла читать топики:\n"
+                    "1. Добавь меня **Администратором** в группу (с правом читать сообщения) ИЛИ в @BotFather отключи `/setprivacy`.\n"
+                    "2. После этого я автоматически буду сохранять и знать все сообщения каждого топика!"
+                )
+            else:
+                top_names = ", ".join([f"«{t['topic_title']}»" for t in known])
+                await event.reply(
+                    f"🔍 Я не нашла сообщений по этому вопросу.\n"
+                    f"Отслеживаемые топики в группе: {top_names}."
+                )
+            return True
+
+        ctx = format_messages_for_prompt(msgs)
+        ans = await answer_with_group_context(text, ctx, user_id=user_id)
+        await event.reply(ans)
+        return True
+
     if intent.is_pdf:
         status = await event.reply("📄 Генерирую PDF-файл, подожди пару секунд...")
         try:
-            pdf_bytes = await generate_pdf_from_prompt(text, user_id=user_id)
+            pdf_prompt = text
+            if "групп" in text.lower() or "топик" in text.lower() or intent.group_topic_name:
+                cid = event.chat_id if not event.is_private else get_default_chat_id()
+                msgs = search_group_messages(topic_name=intent.group_topic_name, chat_id=cid, limit=20)
+                if msgs:
+                    pdf_prompt += f"\n\nДанные из сообщений группы:\n{format_messages_for_prompt(msgs)}"
+            pdf_bytes = await generate_pdf_from_prompt(pdf_prompt, user_id=user_id)
             fname = (intent.pdf_filename or "document.pdf").strip()
             if not fname.lower().endswith(".pdf"): fname += ".pdf"
             pdf_file = io.BytesIO(pdf_bytes)
@@ -204,12 +250,18 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         await event.reply(f"Сначала подключи Gmail: {build_auth_url(user_id)}")
         return True
     try:
+        topic_text = intent.topic
+        if "групп" in text.lower() or "топик" in text.lower() or intent.group_topic_name:
+            cid = event.chat_id if not event.is_private else get_default_chat_id()
+            msgs = search_group_messages(topic_name=intent.group_topic_name, chat_id=cid, limit=15)
+            if msgs:
+                topic_text += f"\n\nДанные из группы:\n{format_messages_for_prompt(msgs)}"
         em = intent.recipient_email or await asyncio.to_thread(find_email_in_history, gmail, intent.recipient_name)
         if not em:
-            user_states[user_id] = ("waiting_for_manual_email", intent.recipient_name, intent.topic, intent.sender_name)
+            user_states[user_id] = ("waiting_for_manual_email", intent.recipient_name, topic_text, intent.sender_name)
             await event.reply(f"Не нашёл email для {intent.recipient_name}. Пришли его почту одним сообщением:")
             return True
-        await send_draft_to_telegram(event, gmail, user_id, em, intent.recipient_name, intent.topic, intent.sender_name)
+        await send_draft_to_telegram(event, gmail, user_id, em, intent.recipient_name, topic_text, intent.sender_name)
     except RefreshError:
         delete_user_token(user_id)
         await event.reply(f"⚠️ Токен Gmail истёк: {build_auth_url(user_id)}")
@@ -255,6 +307,7 @@ async def startup_event():
             lang_code="",
             commands=[
                 types.BotCommand("help", "Все возможности и команды"),
+                types.BotCommand("topics", "Список отслеживаемых топиков"),
                 types.BotCommand("checkportal", "Проверить объявления DGIST"),
                 types.BotCommand("connectmyportal", "Подключить портал DGIST"),
                 types.BotCommand("disconnectportal", "Отключить портал DGIST"),
@@ -313,6 +366,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 📌 **Команды:**
 • /help — список возможностей
+• /topics — список топиков в группе
 • /checkportal — проверить объявления DGIST
 • /connectmyportal — подключить портал DGIST (в ЛС)
 • /disconnectportal — отключить портал DGIST
@@ -321,6 +375,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 ✨ **Возможности (просто напиши или скажи голосом):**
 • 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
+• 📂 **Поиск по топикам группы** — напиши *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.
 • 🎓 **Объявления DGIST** — напиши *«чекни портал»* или *«что нового на портале»*, и я пришлю свежие новости.
 • 📄 **Создание PDF-файлов** — напиши, например, *«Сделай мне пдф по электродинамике»*, и я сгенерирую готовый PDF по нужной теме.
 • 📸 **Работа с фото (до 10 штук)** — отправь от 1 до 10 картинок с вопросом, и я разберу их все сразу.
@@ -337,6 +392,19 @@ async def help_msg(e):
     remember_group_topic(e)
     await e.reply(HELP_TEXT)
 
+@client.on(events.NewMessage(pattern=r'^/topics(@\w+)?(\s|$)'))
+async def show_topics(e):
+    cid = e.chat_id if not e.is_private else get_default_chat_id()
+    topics = list_known_topics(cid)
+    if not topics:
+        await e.reply("📭 Я пока ещё не зафиксировала топиков или сообщений в группе.\n\nУбедись, что я добавлена в группу администратором (с правом чтения сообщений).")
+        return
+    lines = ["📋 **Топики в группе, которые я отслеживаю:**\n"]
+    for idx, t in enumerate(topics, 1):
+        lines.append(f"{idx}. 📌 **{t['topic_title']}** (сообщений: {t['message_count']})")
+    lines.append("\n💡 Спроси меня: *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.")
+    await e.reply("\n".join(lines))
+
 @client.on(events.NewMessage(pattern=r'^/(connectgmail|reconnect)(@\w+)?(\s|$)'))
 async def connect_gmail(e):
     delete_user_token(e.sender_id)
@@ -347,8 +415,22 @@ async def send_shak(e):
     user_states[e.sender_id] = "waiting_for_submitmessage"
     await e.reply('Напиши сообщение в формате: `!username/текст`')
 
+@client.on(events.MessageEdited)
+async def on_message_edited(event):
+    if not event.is_private:
+        try:
+            await record_group_message(client, event)
+        except Exception:
+            pass
+
 @client.on(events.NewMessage)
 async def necessary_task_handler(event):
+    if not event.is_private:
+        try:
+            await record_group_message(client, event)
+        except Exception as ex:
+            print(f"Record group msg error: {ex}")
+
     if event.text and event.text.startswith("/"): return
     uid, sender = event.sender_id, await event.get_sender()
     state = user_states.get(uid)
@@ -358,6 +440,7 @@ async def necessary_task_handler(event):
         mentioned = bool(
             event.mentioned or "@" in raw_l or "кристин" in raw_l
             or "christin" in raw_l or "портал" in raw_l or "portal" in raw_l
+            or "топик" in raw_l or "групп" in raw_l
         )
         if mentioned:
             remember_group_topic(event)
