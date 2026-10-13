@@ -280,7 +280,15 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
                         lines.append(f"   🔗 [Открыть]({ev['link']})")
                 await status_list.edit("\n".join(lines), link_preview=False)
             except Exception as ex:
-                if "insufficient" in str(ex).lower() or "403" in str(ex):
+                err_str = str(ex).lower()
+                if "disabled" in err_str or "not been used in project" in err_str or "accessnotconfigured" in err_str:
+                    await status_list.edit(
+                        "❌ **Google Calendar API не включён в твоём Google Cloud!**\n\n"
+                        "Перейди по ссылке и нажми кнопку **«Включить» (Enable)**:\n"
+                        "👉 https://console.cloud.google.com/apis/library/calendar-json.googleapis.com\n\n"
+                        "После включения просто нажми /calendar снова (переподключать не нужно)!"
+                    )
+                elif "insufficient" in err_str or "invalid_grant" in err_str:
                     delete_user_token(user_id)
                     await status_list.edit(f"⚠️ Нужно обновить доступ к Google Календарю: {build_auth_url(user_id)}")
                 else:
@@ -335,7 +343,15 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
                 btns.append([Button.url("📅 Открыть в Календаре", event_link)])
             await status_msg.edit(resp_text, buttons=btns if btns else None, link_preview=False)
         except Exception as ex:
-            if "insufficient" in str(ex).lower() or "403" in str(ex):
+            err_str = str(ex).lower()
+            if "disabled" in err_str or "not been used in project" in err_str or "accessnotconfigured" in err_str:
+                await status_msg.edit(
+                    "❌ **Google Calendar API не включён в твоём Google Cloud!**\n\n"
+                    "Перейди по ссылке и нажми синюю кнопку **«Включить» (Enable)**:\n"
+                    "👉 https://console.cloud.google.com/apis/library/calendar-json.googleapis.com\n\n"
+                    "После включения просто напиши мне свои планы ещё раз (аккаунт заново подключать не нужно)!"
+                )
+            elif "insufficient" in err_str or "invalid_grant" in err_str:
                 delete_user_token(user_id)
                 await status_msg.edit(f"⚠️ Нужно обновить доступ к Google Календарю: {build_auth_url(user_id)}")
             else:
@@ -533,7 +549,15 @@ async def show_calendar_cmd(e):
                 lines.append(f"   🔗 [Открыть]({ev['link']})")
         await status_list.edit("\n".join(lines), link_preview=False)
     except Exception as ex:
-        if "insufficient" in str(ex).lower() or "403" in str(ex):
+        err_str = str(ex).lower()
+        if "disabled" in err_str or "not been used in project" in err_str or "accessnotconfigured" in err_str:
+            await status_list.edit(
+                "❌ **Google Calendar API не включён в твоём Google Cloud!**\n\n"
+                "Перейди по ссылке и нажми кнопку **«Включить» (Enable)**:\n"
+                "👉 https://console.cloud.google.com/apis/library/calendar-json.googleapis.com\n\n"
+                "После включения просто нажми /calendar снова (переподключать не нужно)!"
+            )
+        elif "insufficient" in err_str or "invalid_grant" in err_str:
             delete_user_token(e.sender_id)
             await status_list.edit(f"⚠️ Нужно обновить доступ к Google Календарю: {build_auth_url(e.sender_id)}")
         else:
