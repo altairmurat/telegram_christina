@@ -27,6 +27,10 @@ from group_memory import (
     record_group_message, search_group_messages, list_known_topics,
     format_messages_for_prompt, get_default_chat_id
 )
+from google_calendar import (
+    create_calendar_event, list_calendar_events, schedule_telegram_reminder,
+    run_reminder_worker
+)
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 app = FastAPI()
@@ -35,7 +39,12 @@ client = TelegramClient('session_bot_korean', API_ID, API_HASH)
 user_states, draft_cache, text_cache, pkce_store = {}, {}, {}, {}
 pending_photos, pending_captions, photo_tasks = defaultdict(list), {}, {}
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.readonly"
+]
 CLIENT_CONFIG = {"web": {"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
                          "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                          "token_uri": "https://oauth2.googleapis.com/token", "redirect_uris": [REDIRECT_URI]}}
@@ -98,7 +107,7 @@ async def gmail_callback(request: FastAPIRequest):
         flow.code_verifier = pkce_store.pop(user_id, None)
         flow.fetch_token(code=request.query_params.get("code"))
         save_user_token(user_id, flow.credentials)
-        try: await client.send_message(user_id, "✅ Gmail подключен! Можешь просить меня писать письма.")
+        try: await client.send_message(user_id, "✅ Google аккаунт (Календарь и Gmail) успешно подключён! Можешь просить меня записывать планы в календарь, напоминать о делах и писать письма.")
         except Exception: pass
         return HTMLResponse("<h2>Готово! Закрой эту вкладку и вернись в Telegram.</h2>")
     except Exception as e:
@@ -242,6 +251,95 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
             await status.delete()
         except Exception as ex:
             await status.edit(f"❌ Не удалось сгенерировать PDF: {ex}")
+    if intent.is_calendar:
+        creds = await asyncio.to_thread(load_user_creds, user_id)
+        if not creds:
+            await event.reply(
+                f"📅 Для работы с Google Календарём сначала подключи Google аккаунт:\n{build_auth_url(user_id)}"
+            )
+            return True
+
+        if intent.calendar_action == "list":
+            status_list = await event.reply("📅 Загружаю события из Google Календаря...")
+            try:
+                events_list = await asyncio.to_thread(list_calendar_events, creds, 10)
+                if not events_list:
+                    await status_list.edit("📅 На ближайшее время событий в Google Календаре не найдено.")
+                    return True
+                lines = ["📅 **Ближайшие планы в Google Календаре:**\n"]
+                for idx, ev in enumerate(events_list, 1):
+                    badge = "🔥 [Важно] " if ev.get("is_important") else ""
+                    st = ev.get("start") or ""
+                    if "T" in st:
+                        d_part, t_part = st.split("T", 1)
+                        st_clean = f"{d_part[5:]} в {t_part[:5]}"
+                    else:
+                        st_clean = st
+                    lines.append(f"{idx}. {badge}**{ev['summary']}** — {st_clean}")
+                    if ev.get("link"):
+                        lines.append(f"   🔗 [Открыть]({ev['link']})")
+                await status_list.edit("\n".join(lines), link_preview=False)
+            except Exception as ex:
+                if "insufficient" in str(ex).lower() or "403" in str(ex):
+                    delete_user_token(user_id)
+                    await status_list.edit(f"⚠️ Нужно обновить доступ к Google Календарю: {build_auth_url(user_id)}")
+                else:
+                    await status_list.edit(f"❌ Ошибка получения событий: {ex}")
+            return True
+
+        # calendar_action == "create"
+        summary = intent.calendar_summary or "Новая задача"
+        start_iso = intent.calendar_start_iso
+        if not start_iso:
+            from datetime import datetime, timedelta
+            start_iso = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00")
+
+        status_msg = await event.reply("📅 Записываю событие в Google Календарь...")
+        try:
+            created_event = await asyncio.to_thread(
+                create_calendar_event,
+                creds,
+                summary,
+                start_iso,
+                intent.calendar_end_iso,
+                intent.calendar_description,
+                intent.is_important,
+                intent.reminder_minutes
+            )
+            event_link = created_event.get("htmlLink", "")
+
+            # Планируем прямое напоминание в Telegram
+            mins_before = 30 if intent.is_important else 15
+            schedule_telegram_reminder(
+                telegram_user_id=user_id,
+                title=summary,
+                start_iso=start_iso,
+                is_important=intent.is_important,
+                event_id=created_event.get("id"),
+                minutes_before=mins_before
+            )
+
+            priority_str = "🔥 **Очень важно (Высокий приоритет)**" if intent.is_important else "Обычный"
+            remind_str = "за 10, 30 и 60 мин (email + push)" if intent.is_important else f"за {mins_before} мин (push)"
+            time_display = start_iso.replace("T", " в ")[:18]
+
+            resp_text = (
+                f"✅ **Событие добавлено в Google Календарь!**\n\n"
+                f"📌 **Задача:** {summary}\n"
+                f"🕒 **Время:** {time_display}\n"
+                f"⚡ **Приоритет:** {priority_str}\n"
+                f"🔔 **Напоминания:** {remind_str} + в Telegram за {mins_before} мин"
+            )
+            btns = []
+            if event_link:
+                btns.append([Button.url("📅 Открыть в Календаре", event_link)])
+            await status_msg.edit(resp_text, buttons=btns if btns else None, link_preview=False)
+        except Exception as ex:
+            if "insufficient" in str(ex).lower() or "403" in str(ex):
+                delete_user_token(user_id)
+                await status_msg.edit(f"⚠️ Нужно обновить доступ к Google Календарю: {build_auth_url(user_id)}")
+            else:
+                await status_msg.edit(f"❌ Ошибка добавления в календарь: {ex}")
         return True
 
     if not intent.is_email: return False
@@ -301,17 +399,19 @@ async def startup_event():
     except Exception as e: print(f"DB init error: {e}")
     await client.start(bot_token=BOT_TOKEN)
     register_dgist_handlers(client, user_states)
+    asyncio.create_task(run_reminder_worker(client))
     try:
         await client(functions.bots.SetBotCommandsRequest(
             scope=types.BotCommandScopeDefault(),
             lang_code="",
             commands=[
                 types.BotCommand("help", "Все возможности и команды"),
+                types.BotCommand("calendar", "Ближайшие планы в Google Календаре"),
+                types.BotCommand("connectgoogle", "Подключить Google (Календарь и Gmail)"),
                 types.BotCommand("topics", "Список отслеживаемых топиков"),
                 types.BotCommand("checkportal", "Проверить объявления DGIST"),
                 types.BotCommand("connectmyportal", "Подключить портал DGIST"),
                 types.BotCommand("disconnectportal", "Отключить портал DGIST"),
-                types.BotCommand("connectgmail", "Подключить Gmail"),
                 types.BotCommand("cancel", "Отменить действие"),
             ]
         ))
@@ -366,20 +466,22 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 📌 **Команды:**
 • /help — список возможностей
+• /calendar — ближайшие планы в календаре
+• /connectgoogle — подключить Google (Календарь и Gmail)
 • /topics — список топиков в группе
 • /checkportal — проверить объявления DGIST
 • /connectmyportal — подключить портал DGIST (в ЛС)
 • /disconnectportal — отключить портал DGIST
-• /connectgmail — подключить Gmail
 • /cancel — отменить текущее действие
 
 ✨ **Возможности (просто напиши или скажи голосом):**
 • 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
+• 📅 **Google Календарь и напоминания** — напиши, например: *«Запиши в календарь: сегодня в 19:00 созвон, это оч важно, напомни»* или *«Что у меня по планам?»* — я добавлю событие в календарь, настрою push-уведомления и пришлю напоминание прямо в Telegram!
 • 📂 **Поиск по топикам группы** — напиши *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.
 • 🎓 **Объявления DGIST** — напиши *«чекни портал»* или *«что нового на портале»*, и я пришлю свежие новости.
 • 📄 **Создание PDF-файлов** — напиши, например, *«Сделай мне пдф по электродинамике»*, и я сгенерирую готовый PDF по нужной теме.
 • 📸 **Работа с фото (до 10 штук)** — отправь от 1 до 10 картинок с вопросом, и я разберу их все сразу.
-• 🎙 **Голосовые сообщения** — отправь войс, и я отвечу на вопрос, сделаю PDF или подготовлю письмо.
+• 🎙 **Голосовые сообщения** — отправь войс, и я запишу план в календарь, отвечу на вопрос, сделаю PDF или подготовлю письмо.
 • 📧 **Отправка Email** — напиши *«Напиши письмо профессору Киму о встрече»*, и я создам готовый черновик с кнопками отправки и редактирования."""
 
 @client.on(events.NewMessage(pattern=r'^/start(@\w+)?(\s|$)'))
@@ -405,10 +507,42 @@ async def show_topics(e):
     lines.append("\n💡 Спроси меня: *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.")
     await e.reply("\n".join(lines))
 
-@client.on(events.NewMessage(pattern=r'^/(connectgmail|reconnect)(@\w+)?(\s|$)'))
+@client.on(events.NewMessage(pattern=r'^/calendar(@\w+)?(\s|$)'))
+async def show_calendar_cmd(e):
+    creds = await asyncio.to_thread(load_user_creds, e.sender_id)
+    if not creds:
+        await e.reply(f"📅 Сначала подключи Google аккаунт:\n{build_auth_url(e.sender_id)}")
+        return
+    status_list = await e.reply("📅 Загружаю события из Google Календаря...")
+    try:
+        events_list = await asyncio.to_thread(list_calendar_events, creds, 10)
+        if not events_list:
+            await status_list.edit("📅 На ближайшее время событий в твоем Google Календаре не найдено.")
+            return
+        lines = ["📅 **Твои ближайшие планы в Google Календаре:**\n"]
+        for idx, ev in enumerate(events_list, 1):
+            badge = "🔥 [Важно] " if ev.get("is_important") else ""
+            st = ev.get("start") or ""
+            if "T" in st:
+                d_part, t_part = st.split("T", 1)
+                st_clean = f"{d_part[5:]} в {t_part[:5]}"
+            else:
+                st_clean = st
+            lines.append(f"{idx}. {badge}**{ev['summary']}** — {st_clean}")
+            if ev.get("link"):
+                lines.append(f"   🔗 [Открыть]({ev['link']})")
+        await status_list.edit("\n".join(lines), link_preview=False)
+    except Exception as ex:
+        if "insufficient" in str(ex).lower() or "403" in str(ex):
+            delete_user_token(e.sender_id)
+            await status_list.edit(f"⚠️ Нужно обновить доступ к Google Календарю: {build_auth_url(e.sender_id)}")
+        else:
+            await status_list.edit(f"❌ Ошибка получения событий: {ex}")
+
+@client.on(events.NewMessage(pattern=r'^/(connectgoogle|connectcalendar|connectgmail|reconnect)(@\w+)?(\s|$)'))
 async def connect_gmail(e):
     delete_user_token(e.sender_id)
-    await e.reply(f"⚠️ **Подключение Gmail**\n\nАвторизуйся по ссылке:\n{build_auth_url(e.sender_id)}")
+    await e.reply(f"⚠️ **Подключение Google (Календарь и Gmail)**\n\nАвторизуйся по ссылке:\n{build_auth_url(e.sender_id)}")
 
 @client.on(events.NewMessage(pattern=r'(?i)^/sendShak(@\w+)?(\s|$)'))
 async def send_shak(e):

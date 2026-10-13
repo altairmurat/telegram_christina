@@ -16,12 +16,20 @@ user_contexts = defaultdict(lambda: deque(maxlen=20))
 class UserIntent(BaseModel):
     intent: str = Field(
         default="chat",
-        description="'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; 'chat' for everything else"
+        description="'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; 'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; 'chat' for everything else"
     )
     is_email: bool = Field(default=False, description="True if intent == 'email'")
     is_pdf: bool = Field(default=False, description="True if intent == 'pdf'")
     is_portal: bool = Field(default=False, description="True if intent == 'portal'")
     is_group_query: bool = Field(default=False, description="True if intent == 'group_query' or user asks about group messages/topics")
+    is_calendar: bool = Field(default=False, description="True if intent == 'calendar' or user asks about calendar/plans/reminders")
+    calendar_action: str = Field(default="create", description="'create' to add/schedule event or reminder, 'list' to view upcoming calendar plans")
+    calendar_summary: str = Field(default="", description="Clean, concise title of the plan/task, e.g. 'Сделать домашку по физике'")
+    calendar_start_iso: str = Field(default="", description="Start time in ISO 8601 (YYYY-MM-DDTHH:MM:SS), calculated using current_time and user prompt")
+    calendar_end_iso: str = Field(default="", description="End time in ISO 8601 (YYYY-MM-DDTHH:MM:SS), default 1 hour after start if not specified")
+    is_important: bool = Field(default=False, description="True if user mentioned 'оч важно', 'срочно', 'супер важно', 'важно', 'high priority'")
+    reminder_minutes: list[int] = Field(default_factory=lambda: [15], description="Minutes before event to remind user, e.g. [15] or [10, 30, 60] if important")
+    calendar_description: str = Field(default="", description="Optional additional details for the calendar event")
     group_topic_name: str = Field(default="", description="Name or title of the group topic if mentioned (e.g. 'important announcements', 'homework', 'general')")
     group_search_query: str = Field(default="", description="Key terms or topic to search within group messages")
     recipient_name: str = Field(default="", description="Name of recipient if email")
@@ -37,15 +45,19 @@ class EmailDraft(BaseModel):
     body: str = Field(description="Email body text")
 
 async def parse_user_intent(text: str) -> UserIntent:
-    """Определяет намерение пользователя (email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
+    """Определяет намерение пользователя (calendar / email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
+    from datetime import datetime
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00 (%A)")
+    prompt = f"Current time: {now_str} (Asia/Seoul timezone, UTC+9). Parse this user request:\n\"{text}\""
     cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=UserIntent, temperature=0.1)
-    res = await client.aio.models.generate_content(model=MODEL, contents=text, config=cfg)
+    res = await client.aio.models.generate_content(model=MODEL, contents=prompt, config=cfg)
     try:
         data = UserIntent.model_validate_json(res.text or "{}")
         if data.intent == "email": data.is_email = True
         elif data.intent == "pdf": data.is_pdf = True
         elif data.intent == "portal": data.is_portal = True
         elif data.intent == "group_query": data.is_group_query = True
+        elif data.intent == "calendar": data.is_calendar = True
         return data
     except Exception:
         return UserIntent(intent="chat")

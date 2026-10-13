@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, String, ForeignKey, Text, BigInteger, DateTime
+from sqlalchemy import Column, Integer, Float, String, ForeignKey, Text, BigInteger, DateTime, Boolean
 import datetime
 from database import Base
 
@@ -66,4 +66,17 @@ class GroupMessage(Base):
     sender_name = Column(String, nullable=True)
     text = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+class CalendarReminder(Base):
+    __tablename__ = "calendar_reminders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id = Column(BigInteger, index=True)
+    event_id = Column(String, nullable=True)
+    title = Column(String)
+    event_time_str = Column(String, nullable=True)
+    remind_at = Column(DateTime, index=True)
+    is_important = Column(Boolean, default=False)
+    is_sent = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
