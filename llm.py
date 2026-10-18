@@ -214,20 +214,21 @@ async def generate_pdf_from_prompt(prompt: str, user_id: int | None = None) -> b
 
 class VideoModerationResult(BaseModel):
     is_safe: bool = Field(
+        default=True,
         description=(
-            "False if the user request OR attached image involves ANY of: nudity, sexual/erotic/NSFW content, "
-            "violence, murder, gore, blood, torture, weapons aimed at people, self-harm, suicide, cruelty to animals/humans, "
-            "terrorism, extremism, hate symbols (swastika, Nazi, etc.), hate speech, bullying/humiliation/deepfakes of real people, "
-            "illegal drugs, child exploitation/safety risks, or disgusting/shocking/gruesome themes. True ONLY if completely safe and benign."
+            "Set to False ONLY for extreme/illegal content: (1) explicit pornography, nudity, or sexual acts (18+ NSFW), "
+            "(2) graphic gore, dismemberment, torture, or murder of humans, (3) child sexual abuse/exploitation (CSAM), "
+            "(4) suicide or self-harm, (5) terrorism/ISIS/Nazi propaganda or mass shootings. "
+            "Set to True for EVERYTHING ELSE, including wild animals chasing/running, action scenes, humor, memes, scary/thriller scenes, etc."
         )
     )
     rejection_reason_ru: str = Field(
         default="",
-        description="If is_safe is False, a short polite explanation in Russian why the request was blocked by the safety filter."
+        description="If is_safe is False, a short explanation in Russian why the request was blocked."
     )
     prompt_en: str = Field(
         default="",
-        description="If is_safe is True, a concise, vivid English visual description (1-2 sentences) for the video generator."
+        description="If is_safe is True, a concise, vivid English visual description (1-2 sentences) for the video generator, incorporating details from the attached image if present."
     )
 
 async def moderate_and_prepare_video_prompt(
@@ -236,7 +237,8 @@ async def moderate_and_prepare_video_prompt(
     image_bytes: bytes | None = None
 ) -> tuple[bool, str, str]:
     """
-    Проверяет запрос и изображение (если есть) через ИИ-модератор безопасности.
+    Проверяет запрос и изображение (если есть) только на жёсткий запрещённый контент (18+, расчленёнка, терроризм, суицид, CSAM)
+    и формирует английский визуальный промпт с учётом фото.
     Возвращает (is_safe, prompt_en, rejection_reason_ru).
     """
     parts = []
@@ -247,27 +249,27 @@ async def moderate_and_prepare_video_prompt(
             text=(
                 f"User video generation request: \"{user_text}\"\n"
                 f"Draft English prompt: \"{existing_en}\"\n\n"
-                "Strictly evaluate safety. Reject ANY NSFW, sexual, violent, gory, horrific, cruel, hateful, extremist, "
-                "self-harm, illegal, or humiliating content (in either text or attached image). "
-                "If safe, provide a clean 1-2 sentence English visual prompt."
+                "Rules:\n"
+                "1. Be permissive! ALLOW (is_safe=true) all normal, funny, creative, action, thriller, wild animals (e.g. a boar running toward the camera), memes, and cinematic scenes.\n"
+                "2. ONLY reject (is_safe=false) if the request or image contains extreme violations: explicit porn/nudity (18+ NSFW), graphic gore/murder/torture, child abuse (CSAM), suicide/self-harm, or terrorism/Nazi propaganda.\n"
+                "3. If an image is attached and the user refers to objects/animals/people in it (like 'это животное'), identify what is shown in the image and write a clear 1-2 sentence English visual prompt for the video model."
             )
         )
     )
     cfg = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=VideoModerationResult,
-        temperature=0.1,
+        temperature=0.2,
     )
     res = await client.aio.models.generate_content(model=MODEL, contents=parts, config=cfg)
     try:
         mod = VideoModerationResult.model_validate_json(res.text or "{}")
         if not mod.is_safe:
-            reason = mod.rejection_reason_ru or "Запрос содержит недопустимый или небезопасный контент."
+            reason = mod.rejection_reason_ru or "Запрос содержит строго запрещённый контент (18+ / жесть)."
             return False, "", f"🛡️ **Запрос отклонён фильтром безопасности:** {reason}"
         final_en = (mod.prompt_en or existing_en or user_text).strip()
         return True, final_en, ""
     except Exception:
-        # Если сама Gemini заблокировала ответ из-за встроенных safety-фильтров
         return (
             False,
             "",
