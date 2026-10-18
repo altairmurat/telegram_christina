@@ -212,19 +212,74 @@ async def generate_pdf_from_prompt(prompt: str, user_id: int | None = None) -> b
         user_contexts[user_id].append(types.Content(role="model", parts=[types.Part.from_text(text=f"[Сгенерирован PDF документ по теме: {prompt}]")]))
     return result
 
+class VideoModerationResult(BaseModel):
+    is_safe: bool = Field(
+        description=(
+            "False if the user request OR attached image involves ANY of: nudity, sexual/erotic/NSFW content, "
+            "violence, murder, gore, blood, torture, weapons aimed at people, self-harm, suicide, cruelty to animals/humans, "
+            "terrorism, extremism, hate symbols (swastika, Nazi, etc.), hate speech, bullying/humiliation/deepfakes of real people, "
+            "illegal drugs, child exploitation/safety risks, or disgusting/shocking/gruesome themes. True ONLY if completely safe and benign."
+        )
+    )
+    rejection_reason_ru: str = Field(
+        default="",
+        description="If is_safe is False, a short polite explanation in Russian why the request was blocked by the safety filter."
+    )
+    prompt_en: str = Field(
+        default="",
+        description="If is_safe is True, a concise, vivid English visual description (1-2 sentences) for the video generator."
+    )
+
+async def moderate_and_prepare_video_prompt(
+    user_text: str,
+    existing_en: str = "",
+    image_bytes: bytes | None = None
+) -> tuple[bool, str, str]:
+    """
+    Проверяет запрос и изображение (если есть) через ИИ-модератор безопасности.
+    Возвращает (is_safe, prompt_en, rejection_reason_ru).
+    """
+    parts = []
+    if image_bytes:
+        parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+    parts.append(
+        types.Part.from_text(
+            text=(
+                f"User video generation request: \"{user_text}\"\n"
+                f"Draft English prompt: \"{existing_en}\"\n\n"
+                "Strictly evaluate safety. Reject ANY NSFW, sexual, violent, gory, horrific, cruel, hateful, extremist, "
+                "self-harm, illegal, or humiliating content (in either text or attached image). "
+                "If safe, provide a clean 1-2 sentence English visual prompt."
+            )
+        )
+    )
+    cfg = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=VideoModerationResult,
+        temperature=0.1,
+    )
+    res = await client.aio.models.generate_content(model=MODEL, contents=parts, config=cfg)
+    try:
+        mod = VideoModerationResult.model_validate_json(res.text or "{}")
+        if not mod.is_safe:
+            reason = mod.rejection_reason_ru or "Запрос содержит недопустимый или небезопасный контент."
+            return False, "", f"🛡️ **Запрос отклонён фильтром безопасности:** {reason}"
+        final_en = (mod.prompt_en or existing_en or user_text).strip()
+        return True, final_en, ""
+    except Exception:
+        # Если сама Gemini заблокировала ответ из-за встроенных safety-фильтров
+        return (
+            False,
+            "",
+            "🛡️ **Запрос отклонён фильтром безопасности:** генерация подобного контента запрещена.",
+        )
+
 async def prepare_video_prompt_en(user_text: str, existing_en: str = "") -> str:
     """Переводит и адаптирует запрос пользователя в короткий англоязычный визуальный промпт для генерации видео."""
-    if existing_en and len(existing_en.strip()) > 5:
-        return existing_en.strip()
-    cfg = types.GenerateContentConfig(
-        system_instruction=(
-            "Convert the user's video generation request into a concise, vivid English visual prompt (1-2 sentences) "
-            "suitable for a text-to-video / image-to-video AI model. Output ONLY the English prompt, nothing else."
-        ),
-        temperature=0.4,
-    )
-    res = await client.aio.models.generate_content(model=MODEL, contents=user_text, config=cfg)
-    return (res.text or user_text).strip()
+    is_safe, prompt_en, reason = await moderate_and_prepare_video_prompt(user_text, existing_en)
+    if not is_safe:
+        raise ValueError(reason)
+    return prompt_en
 
 async def detect_photo_video_intent(prompt_text: str) -> tuple[bool, str]:
     """Проверяет, просит ли пользователь сгенерировать видео по присланному фото."""
@@ -236,6 +291,6 @@ async def detect_photo_video_intent(prompt_text: str) -> tuple[bool, str]:
         return False, ""
     intent = await parse_user_intent(prompt_text)
     if intent.is_video or any(t in low for t in ("сгенерируй видео", "сделай видео", "создай видео", "оживи", "анимируй", "generate video", "make a video", "видео на")):
-        en_prompt = await prepare_video_prompt_en(prompt_text, intent.video_prompt_en)
-        return True, en_prompt
+        return True, (intent.video_prompt_en or "")
     return False, ""
+

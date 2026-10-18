@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import base64
 import datetime
 import requests
@@ -8,22 +9,72 @@ from database import SessionLocal
 import models
 from env import FAL_KEY, OWNER_ID
 
-# Самая дешёвая и лёгкая видео-модель на fal.ai (~$0.02 за 1 сек видео)
-FAL_T2V_ENDPOINT = "https://fal.run/fal-ai/ltxv-13b-098-distilled"
-FAL_I2V_ENDPOINT = "https://fal.run/fal-ai/ltxv-13b-098-distilled/image-to-video"
+# Самые дешёвые и быстрые (warm-pool) модели на fal.ai с поддержкой генерации ровно 1 секунды:
+# 1) Основная: minimax/h3-max-turbo (~$0.016 за 1 сек при 480P)
+PRIMARY_T2V_MODEL = "minimax/h3-max-turbo/text-to-video"
+PRIMARY_I2V_MODEL = "minimax/h3-max-turbo/image-to-video"
 
-# Жёсткие ограничения для генерации ровно 1-секундного видео в минимальном разрешении
-STRICT_1S_PARAMS = {
-    "resolution": "480p",
-    "num_frames": 25,                    # 25 кадров при 24 fps ≈ 1.04 сек (минимум для 1 сек по формуле 8k+1)
-    "frame_rate": 24,
-    "first_pass_num_inference_steps": 8, # минимальное число шагов дистиллированной модели
-    "enable_detail_pass": False,         # отключаем второй проход для максимальной экономии
-    "expand_prompt": False,
-}
+# 2) Резервная: xai/grok-imagine-video/v1.5/lite ($0.02 за 1 сек при 480p)
+FALLBACK_T2V_MODEL = "xai/grok-imagine-video/v1.5/lite/text-to-video"
+FALLBACK_I2V_MODEL = "xai/grok-imagine-video/v1.5/lite/image-to-video"
 
 # Защита от одновременного запуска нескольких генераций одним пользователем
 _active_video_generations: set[int] = set()
+
+# Жёсткий стоп-лист корней и слов (1-й уровень фильтрации до обращения к API)
+_BANNED_PATTERNS = [
+    # 18+ / NSFW / Порнография / Обнажёнка
+    r"порн", r"секс", r"эрот", r"интим", r"обнаж", r"\bгол(ый|ая|ые|ую|ого|ым)\b",
+    r"сиськ", r"дойк", r"член", r"пенис", r"вагин", r"минет", r"орги[яий]", r"хента[йя]",
+    r"шлюх", r"проститут", r"стриптиз", r"фетиш", r"бдсм", r"bdsm", r"извращ",
+    r"\bporn", r"\bsex", r"\bnsfw\b", r"\bnude", r"\bnaked", r"\berotic", r"\bhentai",
+    r"\bboobs?\b", r"\bbreasts?\b", r"\bpenis\b", r"\bvagina\b", r"\bdick\b", r"\bpussy\b",
+    r"\bstripper", r"\bonlyfans\b", r"\bdeepfake\b", r"дипфейк",
+    # Насилие / Кровь / Жесть / Убийства / Пытки / Расчленёнка
+    r"расчлен", r"убийств", r"\bубить\b", r"\bубива", r"пытк", r"пытать", r"\bтруп",
+    r"кишки", r"обезглав", r"отруба", r"отреза[тьл]", r"кровав", r"кроволи", r"лужа крови",
+    r"изнасил", r"насили[ея]", r"казнь", r"казнит", r"повешен", r"повесить", r"застрел",
+    r"зареза", r"поножовщ", r"истяза", r"живодер", r"увечь",
+    r"\bgore\b", r"\bgory\b", r"\bmurder", r"\btorture", r"\bdecapitat", r"\bdismember",
+    r"\bcorpse", r"\bdead body", r"\brape\b", r"\braping\b", r"\bslaughter", r"\bmutilat",
+    r"\bexecution\b", r"\bbehead", r"\bmassacre", r"\bbloodbath",
+    # Суицид / Селфхарм
+    r"суицид", r"самоубий", r"вскрыть вены", r"селфхарм", r"порезать себя",
+    r"\bsuicid", r"\bself[\s-]?harm", r"\bslit wrist",
+    # Терроризм / Экстремизм / Нацизм / Стрельба
+    r"террор", r"теракт", r"взрывчат", r"шахид", r"игил", r"свастик", r"гитлер",
+    r"нацист", r"нацизм", r"фашист", r"холокост", r"колумбайн", r"скулшутинг",
+    r"стрельба в школе", r"массовый расстрел", r"экстремиз", r"ку-клукс",
+    r"\bterroris", r"\bisis\b", r"\bswastika", r"\bhitler", r"\bnazi", r"\bschool shooting",
+    r"\bkkk\b", r"\bwhite supremac",
+    # Несовершеннолетние / CSAM
+    r"педофил", r"\bлоли\b", r"\bloli\b", r"\bshota\b", r"\bunderage", r"\bchild abuse",
+    r"малолетк", r"детское порн",
+    # Наркотики
+    r"героин", r"мефедрон", r"кокаин", r"амфетамин", r"спайс", r"наркотик", r"передоз",
+    r"употреблени[ея] нарко", r"\bheroin\b", r"\bcocaine\b", r"\bmethamphetamine\b", r"\bfentanyl\b",
+    # Отвратительный / шок-контент
+    r"копро", r"фекали", r"испражн", r"рвот[аы]", r"некрофил", r"зоофил",
+    r"\bscat\b", r"\bnecrophil", r"\bzoophil", r"\bbestiality",
+]
+_COMPILED_BANNED = re.compile("|".join(_BANNED_PATTERNS), re.IGNORECASE)
+
+
+def check_hard_safety_filter(text: str | None) -> tuple[bool, str | None]:
+    """
+    Быстрая проверка текста по чёрному списку опасных/запрещённых тем ДО вызова любых API.
+    Возвращает (True, None), если текст чист, или (False, причина_отказа).
+    """
+    if not text:
+        return True, None
+    normalized = text.lower().replace("ё", "е")
+    if _COMPILED_BANNED.search(normalized):
+        return (
+            False,
+            "🛡️ **Запрос отклонён фильтром безопасности.**\n"
+            "Генерация видео с насилием, жестокостью, 18+ / NSFW, экстремизмом или запрещёнными темами строго заблокирована.",
+        )
+    return True, None
 
 
 def get_fal_key() -> str:
@@ -62,7 +113,6 @@ def is_video_admin(user_id: int | None, username: str | None = None) -> bool:
 
         adm = db.query(models.VideoAdmin).filter(or_(*filters)).first()
         if adm:
-            # Привязываем telegram_user_id или username, если они появились впервые
             updated = False
             if user_id and not adm.telegram_user_id:
                 adm.telegram_user_id = int(user_id)
@@ -160,7 +210,7 @@ def check_video_quota(user_id: int, username: str | None = None) -> tuple[bool, 
     Возвращает (True, None) если можно, иначе (False, текст_ошибки).
     """
     if user_id in _active_video_generations:
-        return False, "⏳ Твоё видео уже генерируется прямо сейчас, подожди несколько секунд!"
+        return False, "⏳ Твоё видео уже генерируется прямо сейчас, подожди немного!"
 
     if is_video_admin(user_id, username):
         return True, None
@@ -225,6 +275,56 @@ def mark_generation_finished(user_id: int):
     _active_video_generations.discard(int(user_id))
 
 
+def _run_fal_queue_job(model_id: str, payload: dict, headers: dict, max_wait_sec: int = 90) -> str:
+    """
+    Отправляет задачу в асинхронную очередь queue.fal.run и опрашивает статус каждые 2.5 сек,
+    чтобы соединение никогда не зависало по ReadTimeout. Возвращает URL готового видео.
+    """
+    submit_url = f"https://queue.fal.run/{model_id}"
+    sub_resp = requests.post(submit_url, headers=headers, json=payload, timeout=25)
+    if sub_resp.status_code not in (200, 201, 202):
+        raise RuntimeError(f"Ошибка запуска ({sub_resp.status_code}): {sub_resp.text[:300]}")
+
+    sub_data = sub_resp.json()
+    # Если ответ пришёл синхронно сразу с видео
+    if isinstance(sub_data.get("video"), dict) and sub_data["video"].get("url"):
+        return sub_data["video"]["url"]
+
+    status_url = sub_data.get("status_url")
+    response_url = sub_data.get("response_url")
+    cancel_url = sub_data.get("cancel_url")
+    if not status_url or not response_url:
+        raise RuntimeError(f"Некорректный ответ очереди fal.ai: {str(sub_data)[:250]}")
+
+    deadline = time.time() + max_wait_sec
+    while time.time() < deadline:
+        time.sleep(2.5)
+        st_resp = requests.get(status_url, headers=headers, timeout=15)
+        if st_resp.status_code not in (200, 202):
+            continue
+        st_json = st_resp.json()
+        status = st_json.get("status", "")
+        if status == "COMPLETED":
+            res_resp = requests.get(response_url, headers=headers, timeout=30)
+            if res_resp.status_code not in (200, 201):
+                raise RuntimeError(f"Ошибка получения видео ({res_resp.status_code}): {res_resp.text[:300]}")
+            res_data = res_resp.json()
+            video_url = (res_data.get("video") or {}).get("url")
+            if not video_url:
+                raise RuntimeError(f"fal.ai не вернул ссылку на видео (возможно, сработал фильтр безопасности).")
+            return video_url
+        if status in ("FAILED", "ERROR", "CANCELLED"):
+            raise RuntimeError(f"Генерация отклонена или завершилась ошибкой: {str(st_json)[:250]}")
+
+    # Если превысили лимит ожидания — отменяем задачу, чтобы не списались деньги
+    if cancel_url:
+        try:
+            requests.put(cancel_url, headers=headers, timeout=10)
+        except Exception:
+            pass
+    raise TimeoutError(f"Модель {model_id} слишком долго в очереди (> {max_wait_sec} сек)")
+
+
 def _generate_video_fal_sync(prompt_en: str, image_bytes: bytes | None = None) -> bytes:
     api_key = get_fal_key()
     if not api_key:
@@ -235,28 +335,41 @@ def _generate_video_fal_sync(prompt_en: str, image_bytes: bytes | None = None) -
         "Content-Type": "application/json",
     }
 
-    payload = {
-        **STRICT_1S_PARAMS,
-        "prompt": (prompt_en or "Cinematic motion, high quality, smooth movement").strip(),
-    }
-
+    clean_prompt = (prompt_en or "Cinematic smooth motion, high quality").strip()
+    data_uri = None
     if image_bytes:
         b64_img = base64.b64encode(image_bytes).decode("ascii")
-        payload["image_url"] = f"data:image/jpeg;base64,{b64_img}"
-        endpoint = FAL_I2V_ENDPOINT
-    else:
-        endpoint = FAL_T2V_ENDPOINT
+        data_uri = f"data:image/jpeg;base64,{b64_img}"
 
-    resp = requests.post(endpoint, headers=headers, json=payload, timeout=180)
-    if resp.status_code not in (200, 201):
-        detail = resp.text[:400]
-        raise RuntimeError(f"Ошибка fal.ai ({resp.status_code}): {detail}")
+    # 1) Пробуем самую дешёвую и быструю модель: minimax/h3-max-turbo (1 сек, 480P, ~$0.016)
+    primary_model = PRIMARY_I2V_MODEL if data_uri else PRIMARY_T2V_MODEL
+    primary_payload = {
+        "prompt": clean_prompt,
+        "duration": 1,
+        "resolution": "480P",
+        "prompt_expansion_mode": "disabled",
+        "enable_safety_checker": True,
+    }
+    if data_uri:
+        primary_payload["image_url"] = data_uri
 
-    data = resp.json()
-    video_url = (data.get("video") or {}).get("url")
-    if not video_url:
-        raise RuntimeError(f"fal.ai не вернул ссылку на видео: {str(data)[:300]}")
+    video_url = None
+    try:
+        video_url = _run_fal_queue_job(primary_model, primary_payload, headers, max_wait_sec=75)
+    except Exception as primary_err:
+        print(f"[FAL] Primary model ({primary_model}) fallback: {primary_err}")
+        # 2) Резервная быстрая модель: xai/grok-imagine-video/v1.5/lite (1 сек, 480p, $0.02)
+        fallback_model = FALLBACK_I2V_MODEL if data_uri else FALLBACK_T2V_MODEL
+        fallback_payload = {
+            "prompt": clean_prompt,
+            "duration": 1,
+            "resolution": "480p",
+            "enable_safety_checker": True,
+        }
+        if data_uri:
+            fallback_payload["image_url"] = data_uri
+        video_url = _run_fal_queue_job(fallback_model, fallback_payload, headers, max_wait_sec=90)
 
-    vid_resp = requests.get(video_url, timeout=120)
+    vid_resp = requests.get(video_url, timeout=60)
     vid_resp.raise_for_status()
     return vid_resp.content

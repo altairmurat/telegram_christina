@@ -17,7 +17,8 @@ import models
 from llm import (
     ask_gemini, transcribe_voice, process_telegram_images,
     parse_user_intent, generate_email_text, generate_pdf_from_prompt,
-    answer_with_group_context, prepare_video_prompt_en, detect_photo_video_intent
+    answer_with_group_context, prepare_video_prompt_en, detect_photo_video_intent,
+    moderate_and_prepare_video_prompt
 )
 from dgist_bot_handlers import (
     register_dgist_handlers, handle_dgist_conversation_step,
@@ -34,7 +35,8 @@ from google_calendar import (
 from fal_video import (
     is_owner, is_video_admin, add_video_admins, remove_video_admins,
     list_video_admins, check_video_quota, record_video_generation,
-    mark_generation_started, mark_generation_finished, _generate_video_fal_sync
+    mark_generation_started, mark_generation_finished, _generate_video_fal_sync,
+    check_hard_safety_filter
 )
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -206,15 +208,39 @@ async def handle_video_generation(
     prompt_en: str = "",
     image_bytes: bytes | None = None
 ):
+    # 1. Быстрая жёсткая проверка текста по чёрному списку до любых запросов
+    safe_txt, block_msg = check_hard_safety_filter(user_text)
+    if not safe_txt:
+        await event.reply(block_msg)
+        return
+    safe_en, block_msg_en = check_hard_safety_filter(prompt_en)
+    if not safe_en:
+        await event.reply(block_msg_en)
+        return
+
+    # 2. Проверка суточного лимита
     allowed, err_msg = await asyncio.to_thread(check_video_quota, user_id, username)
     if not allowed:
         await event.reply(err_msg)
         return
 
     mark_generation_started(user_id)
-    status = await event.reply("🎬 Генерирую 1-секундное видео, подожди ~10–25 секунд...")
+    status = await event.reply("🎬 Проверяю запрос и генерирую 1-секундное видео (~15–35 секунд)...")
     try:
-        final_prompt_en = await prepare_video_prompt_en(user_text, prompt_en)
+        # 3. ИИ-модерация безопасности идеи и прикреплённого фото (если есть) до отправки в fal.ai
+        is_safe, final_prompt_en, reject_reason = await moderate_and_prepare_video_prompt(
+            user_text, prompt_en, image_bytes=image_bytes
+        )
+        if not is_safe:
+            await status.edit(reject_reason)
+            return
+
+        # Повторная проверка итогового промпта по стоп-словам
+        safe_final, block_final = check_hard_safety_filter(final_prompt_en)
+        if not safe_final:
+            await status.edit(block_final)
+            return
+
         vid_bytes = await asyncio.to_thread(_generate_video_fal_sync, final_prompt_en, image_bytes)
         await asyncio.to_thread(record_video_generation, user_id, username, user_text)
 
