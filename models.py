@@ -80,3 +80,19 @@ class CalendarReminder(Base):
     is_sent = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+class VideoAdmin(Base):
+    __tablename__ = "video_admins"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String, unique=True, index=True, nullable=True)  # в нижнем регистре без @
+    telegram_user_id = Column(BigInteger, unique=True, index=True, nullable=True)
+    added_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class VideoGenerationLog(Base):
+    __tablename__ = "video_generation_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id = Column(BigInteger, index=True)
+    username = Column(String, index=True, nullable=True)
+    prompt = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)

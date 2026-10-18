@@ -17,7 +17,7 @@ import models
 from llm import (
     ask_gemini, transcribe_voice, process_telegram_images,
     parse_user_intent, generate_email_text, generate_pdf_from_prompt,
-    answer_with_group_context
+    answer_with_group_context, prepare_video_prompt_en, detect_photo_video_intent
 )
 from dgist_bot_handlers import (
     register_dgist_handlers, handle_dgist_conversation_step,
@@ -30,6 +30,11 @@ from group_memory import (
 from google_calendar import (
     create_calendar_event, list_calendar_events, schedule_telegram_reminder,
     run_reminder_worker
+)
+from fal_video import (
+    is_owner, is_video_admin, add_video_admins, remove_video_admins,
+    list_video_admins, check_video_quota, record_video_generation,
+    mark_generation_started, mark_generation_finished, _generate_video_fal_sync
 )
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -193,8 +198,49 @@ async def send_draft_to_telegram(event, gmail, user_id: int, to: str, name: str,
         ]
         await msg.edit(txt, buttons=fallback_btns)
 
+async def handle_video_generation(
+    event,
+    user_id: int,
+    username: str | None,
+    user_text: str,
+    prompt_en: str = "",
+    image_bytes: bytes | None = None
+):
+    allowed, err_msg = await asyncio.to_thread(check_video_quota, user_id, username)
+    if not allowed:
+        await event.reply(err_msg)
+        return
+
+    mark_generation_started(user_id)
+    status = await event.reply("🎬 Генерирую 1-секундное видео, подожди ~10–25 секунд...")
+    try:
+        final_prompt_en = await prepare_video_prompt_en(user_text, prompt_en)
+        vid_bytes = await asyncio.to_thread(_generate_video_fal_sync, final_prompt_en, image_bytes)
+        await asyncio.to_thread(record_video_generation, user_id, username, user_text)
+
+        vid_file = io.BytesIO(vid_bytes)
+        vid_file.name = "video.mp4"
+        await client.send_file(
+            event.chat_id,
+            vid_file,
+            caption="🎬 Готово! Вот твоё видео.",
+            reply_to=event.id,
+            supports_streaming=True,
+        )
+        await status.delete()
+    except Exception as ex:
+        await status.edit(f"❌ Не удалось сгенерировать видео: {ex}")
+    finally:
+        mark_generation_finished(user_id)
+
 async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     intent = await parse_user_intent(text)
+    if intent.is_video:
+        sender = await event.get_sender()
+        uname = getattr(sender, "username", None) if sender else None
+        await handle_video_generation(event, user_id, uname, text, prompt_en=intent.video_prompt_en)
+        return True
+
     if intent.is_portal:
         await run_portal_check(event)
         return True
@@ -251,6 +297,8 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
             await status.delete()
         except Exception as ex:
             await status.edit(f"❌ Не удалось сгенерировать PDF: {ex}")
+        return True
+
     if intent.is_calendar:
         creds = await asyncio.to_thread(load_user_creds, user_id)
         if not creds:
@@ -492,6 +540,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 ✨ **Возможности (просто напиши или скажи голосом):**
 • 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
+• 🎬 **Генерация видео** — напиши *«Сгенерируй видео на тему...»* или отправь фото с подписью *«Сгенерируй видео на...»*, и я создам короткий видеоролик (доступно 1 видео в день).
 • 📅 **Google Календарь и напоминания** — напиши, например: *«Запиши в календарь: сегодня в 19:00 созвон, это оч важно, напомни»* или *«Что у меня по планам?»* — я добавлю событие в календарь, настрою push-уведомления и пришлю напоминание прямо в Telegram!
 • 📂 **Поиск по топикам группы** — напиши *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.
 • 🎓 **Объявления DGIST** — напиши *«чекни портал»* или *«что нового на портале»*, и я пришлю свежие новости.
@@ -573,6 +622,61 @@ async def send_shak(e):
     user_states[e.sender_id] = "waiting_for_submitmessage"
     await e.reply('Напиши сообщение в формате: `!username/текст`')
 
+@client.on(events.NewMessage(pattern=r'(?i)^/addAdminShak(@\w+)?(?:\s+(.*))?$'))
+async def add_admin_shak_cmd(e):
+    if not is_owner(e.sender_id):
+        await e.reply("⛔ Эта команда доступна только главному администратору.")
+        return
+    args = (e.pattern_match.group(2) or "").strip()
+    if args:
+        added = await asyncio.to_thread(add_video_admins, args)
+        all_admins = await asyncio.to_thread(list_video_admins)
+        await e.reply(
+            f"✅ Добавлены в безлимитные видео-админы: **{', '.join(added) if added else 'никто'}**\n\n"
+            f"📋 **Текущий список безлимита:**\n" + "\n".join(all_admins)
+        )
+    else:
+        user_states[e.sender_id] = "waiting_for_add_admin_shak"
+        all_admins = await asyncio.to_thread(list_video_admins)
+        await e.reply(
+            "👑 **Добавление безлимитного доступа к видео**\n\n"
+            "📋 **Сейчас в списке:**\n" + "\n".join(all_admins) + "\n\n"
+            "Напиши `@username` (или несколько через пробел), кого добавить (или /cancel):"
+        )
+
+@client.on(events.NewMessage(pattern=r'(?i)^/deleteAdminShak(@\w+)?(?:\s+(.*))?$'))
+async def delete_admin_shak_cmd(e):
+    if not is_owner(e.sender_id):
+        await e.reply("⛔ Эта команда доступна только главному администратору.")
+        return
+    args = (e.pattern_match.group(2) or "").strip()
+    if args:
+        removed, not_found = await asyncio.to_thread(remove_video_admins, args)
+        all_admins = await asyncio.to_thread(list_video_admins)
+        msg_parts = []
+        if removed:
+            msg_parts.append(f"🗑 Удалены из безлимита: **{', '.join(removed)}**")
+        if not_found:
+            msg_parts.append(f"⚠️ Не найдены в списке: {', '.join(not_found)}")
+        msg_parts.append("\n📋 **Текущий список безлимита:**\n" + "\n".join(all_admins))
+        await e.reply("\n".join(msg_parts))
+    else:
+        user_states[e.sender_id] = "waiting_for_del_admin_shak"
+        all_admins = await asyncio.to_thread(list_video_admins)
+        await e.reply(
+            "🗑 **Удаление из безлимитного доступа к видео**\n\n"
+            "📋 **Сейчас в списке:**\n" + "\n".join(all_admins) + "\n\n"
+            "Напиши `@username` (или несколько через пробел), кого удалить (или /cancel):"
+        )
+
+@client.on(events.NewMessage(pattern=r'(?i)^/listAdminShak(@\w+)?(\s|$)'))
+async def list_admin_shak_cmd(e):
+    if not is_owner(e.sender_id):
+        await e.reply("⛔ Эта команда доступна только главному администратору.")
+        return
+    all_admins = await asyncio.to_thread(list_video_admins)
+    await e.reply("📋 **Список безлимитных видео-админов:**\n" + "\n".join(all_admins))
+
 @client.on(events.MessageEdited)
 async def on_message_edited(event):
     if not event.is_private:
@@ -599,6 +703,7 @@ async def necessary_task_handler(event):
             event.mentioned or "@" in raw_l or "кристин" in raw_l
             or "christin" in raw_l or "портал" in raw_l or "portal" in raw_l
             or "топик" in raw_l or "групп" in raw_l
+            or "сгенерируй видео" in raw_l or "сделай видео" in raw_l
         )
         if mentioned:
             remember_group_topic(event)
@@ -610,6 +715,29 @@ async def necessary_task_handler(event):
                 return
 
     if await handle_dgist_conversation_step(event, uid, state, user_states): return
+
+    if state == "waiting_for_add_admin_shak" and event.text:
+        user_states.pop(uid, None)
+        added = await asyncio.to_thread(add_video_admins, event.text)
+        all_admins = await asyncio.to_thread(list_video_admins)
+        await event.reply(
+            f"✅ Добавлены в безлимитные видео-админы: **{', '.join(added) if added else 'никто'}**\n\n"
+            f"📋 **Текущий список безлимита:**\n" + "\n".join(all_admins)
+        )
+        return
+
+    if state == "waiting_for_del_admin_shak" and event.text:
+        user_states.pop(uid, None)
+        removed, not_found = await asyncio.to_thread(remove_video_admins, event.text)
+        all_admins = await asyncio.to_thread(list_video_admins)
+        msg_parts = []
+        if removed:
+            msg_parts.append(f"🗑 Удалены из безлимита: **{', '.join(removed)}**")
+        if not_found:
+            msg_parts.append(f"⚠️ Не найдены в списке: {', '.join(not_found)}")
+        msg_parts.append("\n📋 **Текущий список безлимита:**\n" + "\n".join(all_admins))
+        await event.reply("\n".join(msg_parts))
+        return
 
     if isinstance(state, tuple) and state[0] == "waiting_for_manual_email":
         _, name, topic, s_name = state
@@ -677,6 +805,13 @@ async def necessary_task_handler(event):
                 msgs = list(pending_photos.pop(u, []))
                 user_states.pop(u, None)
                 if msgs:
+                    is_vid, vid_prompt_en = await detect_photo_video_intent(cap)
+                    if is_vid:
+                        snd = await ev.get_sender()
+                        uname = getattr(snd, "username", None) if snd else None
+                        img_bytes = await msgs[0].download_media(file=bytes)
+                        await handle_video_generation(ev, u, uname, cap, prompt_en=vid_prompt_en, image_bytes=img_bytes)
+                        return
                     st = await ev.reply(f"⏳ Обрабатываю фото ({len(msgs)} шт.)...")
                     try:
                         ans = await process_telegram_images(msgs, cap, user_id=u)
@@ -698,6 +833,12 @@ async def necessary_task_handler(event):
         user_states.pop(uid, None)
         if msgs:
             clean_txt = re.sub(r"@\w+", "", event.text).strip() or event.text
+            is_vid, vid_prompt_en = await detect_photo_video_intent(clean_txt)
+            if is_vid:
+                uname = getattr(sender, "username", None) if sender else None
+                img_bytes = await msgs[0].download_media(file=bytes)
+                await handle_video_generation(event, uid, uname, clean_txt, prompt_en=vid_prompt_en, image_bytes=img_bytes)
+                return
             st = await event.reply(f"⏳ Обрабатываю фото ({len(msgs)} шт.)...")
             try:
                 ans = await process_telegram_images(msgs, clean_txt, user_id=uid)

@@ -16,8 +16,10 @@ user_contexts = defaultdict(lambda: deque(maxlen=20))
 class UserIntent(BaseModel):
     intent: str = Field(
         default="chat",
-        description="'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; 'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; 'chat' for everything else"
+        description="'video' ONLY if user explicitly asks to generate/create/make a video or animate a photo; 'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; 'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; 'chat' for everything else"
     )
+    is_video: bool = Field(default=False, description="True if intent == 'video' or user asks to generate/make a video or animate an image")
+    video_prompt_en: str = Field(default="", description="Detailed visual prompt in English for generating the video (translate user's video idea into vivid English visual description)")
     is_email: bool = Field(default=False, description="True if intent == 'email'")
     is_pdf: bool = Field(default=False, description="True if intent == 'pdf'")
     is_portal: bool = Field(default=False, description="True if intent == 'portal'")
@@ -45,7 +47,7 @@ class EmailDraft(BaseModel):
     body: str = Field(description="Email body text")
 
 async def parse_user_intent(text: str) -> UserIntent:
-    """Определяет намерение пользователя (calendar / email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
+    """Определяет намерение пользователя (video / calendar / email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
     from datetime import datetime
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00 (%A)")
     prompt = f"Current time: {now_str} (Asia/Seoul timezone, UTC+9). Parse this user request:\n\"{text}\""
@@ -53,7 +55,8 @@ async def parse_user_intent(text: str) -> UserIntent:
     res = await client.aio.models.generate_content(model=MODEL, contents=prompt, config=cfg)
     try:
         data = UserIntent.model_validate_json(res.text or "{}")
-        if data.intent == "email": data.is_email = True
+        if data.intent == "video": data.is_video = True
+        elif data.intent == "email": data.is_email = True
         elif data.intent == "pdf": data.is_pdf = True
         elif data.intent == "portal": data.is_portal = True
         elif data.intent == "group_query": data.is_group_query = True
@@ -208,3 +211,31 @@ async def generate_pdf_from_prompt(prompt: str, user_id: int | None = None) -> b
         user_contexts[user_id].append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
         user_contexts[user_id].append(types.Content(role="model", parts=[types.Part.from_text(text=f"[Сгенерирован PDF документ по теме: {prompt}]")]))
     return result
+
+async def prepare_video_prompt_en(user_text: str, existing_en: str = "") -> str:
+    """Переводит и адаптирует запрос пользователя в короткий англоязычный визуальный промпт для генерации видео."""
+    if existing_en and len(existing_en.strip()) > 5:
+        return existing_en.strip()
+    cfg = types.GenerateContentConfig(
+        system_instruction=(
+            "Convert the user's video generation request into a concise, vivid English visual prompt (1-2 sentences) "
+            "suitable for a text-to-video / image-to-video AI model. Output ONLY the English prompt, nothing else."
+        ),
+        temperature=0.4,
+    )
+    res = await client.aio.models.generate_content(model=MODEL, contents=user_text, config=cfg)
+    return (res.text or user_text).strip()
+
+async def detect_photo_video_intent(prompt_text: str) -> tuple[bool, str]:
+    """Проверяет, просит ли пользователь сгенерировать видео по присланному фото."""
+    if not prompt_text:
+        return False, ""
+    low = prompt_text.lower()
+    video_triggers = ("видео", "видос", "ролик", "video", "оживи", "оживить", "анимируй", "анимировать", "animate")
+    if not any(t in low for t in video_triggers):
+        return False, ""
+    intent = await parse_user_intent(prompt_text)
+    if intent.is_video or any(t in low for t in ("сгенерируй видео", "сделай видео", "создай видео", "оживи", "анимируй", "generate video", "make a video", "видео на")):
+        en_prompt = await prepare_video_prompt_en(prompt_text, intent.video_prompt_en)
+        return True, en_prompt
+    return False, ""
