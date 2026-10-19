@@ -36,14 +36,15 @@ from fal_video import (
     is_owner, is_video_admin, add_video_admins, remove_video_admins,
     list_video_admins, check_video_quota, record_video_generation,
     mark_generation_started, mark_generation_finished, _generate_video_fal_sync,
-    check_hard_safety_filter
+    check_hard_safety_filter, VIDEO_MODELS, DEFAULT_MODEL_KEY, DEFAULT_DURATION_SEC,
+    get_admin_prefs, set_admin_prefs, extract_hints_from_text
 )
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 app = FastAPI()
 client = TelegramClient('session_bot_korean', API_ID, API_HASH)
 
-user_states, draft_cache, text_cache, pkce_store = {}, {}, {}, {}
+user_states, draft_cache, text_cache, pkce_store, video_job_cache = {}, {}, {}, {}, {}
 pending_photos, pending_captions, photo_tasks = defaultdict(list), {}, {}
 
 SCOPES = [
@@ -200,6 +201,47 @@ async def send_draft_to_telegram(event, gmail, user_id: int, to: str, name: str,
         ]
         await msg.edit(txt, buttons=fallback_btns)
 
+def format_video_admin_panel(job: dict) -> str:
+    m_key = job["model"]
+    dur = job["duration"]
+    m_info = VIDEO_MODELS.get(m_key, VIDEO_MODELS[DEFAULT_MODEL_KEY])
+    mode_str = "📸 Фото → Видео" if job.get("image_bytes") else "📝 Текст → Видео"
+    return (
+        f"🎬 **Панель генерации видео (Режим Админа)**\n"
+        f"🔹 **Тип:** {mode_str}\n"
+        f"🔹 **Сюжет:** _{job['prompt_en'][:220]}_\n\n"
+        f"🤖 **Модель:** **{m_info['title']}** ({m_info['price_hint']})\n"
+        f"⏱ **Длительность:** **{dur} сек**\n\n"
+        f"Выбери модель и время (секунды) ниже, затем нажми **«🚀 Сгенерировать»**:"
+    )
+
+def make_video_admin_keyboard(job_id: str, model_key: str, duration_sec: int):
+    model_keys = list(VIDEO_MODELS.keys())
+    rows = []
+    # Кнопки выбора модели (по 2 в ряд)
+    for i in range(0, len(model_keys), 2):
+        row = []
+        for mk in model_keys[i:i + 2]:
+            short_lbl = VIDEO_MODELS[mk]["short"]
+            prefix = "✅ " if mk == model_key else ""
+            row.append(Button.inline(f"{prefix}{short_lbl}", f"vmod:{job_id}:{mk}"))
+        rows.append(row)
+
+    # Кнопки выбора длительности (секунды), поддерживаемые выбранной моделью
+    allowed_durs = VIDEO_MODELS.get(model_key, VIDEO_MODELS[DEFAULT_MODEL_KEY])["durations"]
+    dur_row = []
+    for d in allowed_durs:
+        prefix = "✅ " if int(d) == int(duration_sec) else ""
+        dur_row.append(Button.inline(f"{prefix}{d} сек", f"vdur:{job_id}:{d}"))
+    rows.append(dur_row)
+
+    # Кнопки запуска и отмены
+    rows.append([
+        Button.inline("🚀 Сгенерировать видео", f"vrun:{job_id}"),
+        Button.inline("❌ Отмена", f"vcancel:{job_id}"),
+    ])
+    return rows
+
 async def handle_video_generation(
     event,
     user_id: int,
@@ -218,14 +260,18 @@ async def handle_video_generation(
         await event.reply(block_msg_en)
         return
 
-    # 2. Проверка суточного лимита
+    # 2. Проверка прав админа и суточного лимита
+    is_adm = await asyncio.to_thread(is_video_admin, user_id, username)
     allowed, err_msg = await asyncio.to_thread(check_video_quota, user_id, username)
     if not allowed:
         await event.reply(err_msg)
         return
 
-    mark_generation_started(user_id)
-    status = await event.reply("🎬 Проверяю запрос и генерирую 1-секундное видео (~15–35 секунд)...")
+    status = await event.reply(
+        "🎬 Подготавливаю панель генерации..." if is_adm
+        else "🎬 Проверяю запрос и генерирую 1-секундное видео (~15–35 секунд)..."
+    )
+
     try:
         # 3. ИИ-модерация безопасности идеи и прикреплённого фото (если есть) до отправки в fal.ai
         is_safe, final_prompt_en, reject_reason = await moderate_and_prepare_video_prompt(
@@ -241,23 +287,55 @@ async def handle_video_generation(
             await status.edit(block_final)
             return
 
-        vid_bytes = await asyncio.to_thread(_generate_video_fal_sync, final_prompt_en, image_bytes)
-        await asyncio.to_thread(record_video_generation, user_id, username, user_text)
+        # 4А. Если это АДМИН — открываем интерактивное меню выбора модели и секунд
+        if is_adm:
+            m_hint, d_hint = extract_hints_from_text(user_text)
+            prefs = set_admin_prefs(user_id, m_hint, d_hint)
+            job_id = secrets.token_hex(4)
+            job = {
+                "user_id": user_id,
+                "username": username,
+                "chat_id": event.chat_id,
+                "reply_to": event.id,
+                "user_text": user_text,
+                "prompt_en": final_prompt_en,
+                "image_bytes": image_bytes,
+                "model": prefs["model"],
+                "duration": prefs["duration"],
+            }
+            video_job_cache[job_id] = job
+            panel_txt = format_video_admin_panel(job)
+            kb = make_video_admin_keyboard(job_id, job["model"], job["duration"])
+            await status.edit(panel_txt, buttons=kb)
+            return
 
-        vid_file = io.BytesIO(vid_bytes)
-        vid_file.name = "video.mp4"
-        await client.send_file(
-            event.chat_id,
-            vid_file,
-            caption="🎬 Готово! Вот твоё видео.",
-            reply_to=event.id,
-            supports_streaming=True,
-        )
-        await status.delete()
+        # 4Б. Если это ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ — строго 1 секунда на самой слабой модели без выбора
+        mark_generation_started(user_id)
+        try:
+            vid_bytes = await asyncio.to_thread(
+                _generate_video_fal_sync,
+                final_prompt_en,
+                image_bytes,
+                DEFAULT_MODEL_KEY,
+                DEFAULT_DURATION_SEC,
+                False,
+            )
+            await asyncio.to_thread(record_video_generation, user_id, username, user_text)
+
+            vid_file = io.BytesIO(vid_bytes)
+            vid_file.name = "video.mp4"
+            await client.send_file(
+                event.chat_id,
+                vid_file,
+                caption="🎬 Готово! Вот твоё видео.",
+                reply_to=event.id,
+                supports_streaming=True,
+            )
+            await status.delete()
+        finally:
+            mark_generation_finished(user_id)
     except Exception as ex:
         await status.edit(f"❌ Не удалось сгенерировать видео: {ex}")
-    finally:
-        mark_generation_finished(user_id)
 
 async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     intent = await parse_user_intent(text)
@@ -460,7 +538,89 @@ async def on_callback(event):
     data = event.data.decode()
     if ":" not in data: return
     parts = data.split(":")
-    action, draft_id = parts[0], parts[1] if len(parts) > 1 else ""
+    action, arg1 = parts[0], parts[1] if len(parts) > 1 else ""
+
+    # Обработка кнопок админ-панели генерации видео
+    if action in ("vmod", "vdur", "vrun", "vcancel"):
+        job_id = arg1
+        job = video_job_cache.get(job_id)
+        if not job:
+            return await event.answer("⚠️ Эта панель устарела или уже запущена.", alert=True)
+
+        sender = await event.get_sender()
+        uname = getattr(sender, "username", None) if sender else None
+        is_adm = await asyncio.to_thread(is_video_admin, event.sender_id, uname)
+        if not is_adm:
+            return await event.answer("⛔ Выбор модели и длительности доступен только админам!", alert=True)
+
+        if action == "vcancel":
+            video_job_cache.pop(job_id, None)
+            return await event.edit("❌ Генерация видео отменена.", buttons=None)
+
+        if action == "vmod" and len(parts) > 2:
+            new_model = parts[2]
+            prefs = set_admin_prefs(event.sender_id, model_key=new_model)
+            job["model"] = prefs["model"]
+            job["duration"] = prefs["duration"]
+            return await event.edit(
+                format_video_admin_panel(job),
+                buttons=make_video_admin_keyboard(job_id, job["model"], job["duration"])
+            )
+
+        if action == "vdur" and len(parts) > 2 and parts[2].isdigit():
+            new_dur = int(parts[2])
+            prefs = set_admin_prefs(event.sender_id, duration=new_dur)
+            job["duration"] = prefs["duration"]
+            return await event.edit(
+                format_video_admin_panel(job),
+                buttons=make_video_admin_keyboard(job_id, job["model"], job["duration"])
+            )
+
+        if action == "vrun":
+            video_job_cache.pop(job_id, None)
+            m_key = job["model"]
+            dur = job["duration"]
+            m_title = VIDEO_MODELS.get(m_key, VIDEO_MODELS[DEFAULT_MODEL_KEY])["short"]
+            mark_generation_started(job["user_id"])
+            await event.edit(
+                f"🎬 **Генерирую видео...**\n"
+                f"🤖 Модель: **{m_title}**\n"
+                f"⏱ Длительность: **{dur} сек**\n\n"
+                f"⏳ Подожди немного (~15–60 секунд)...",
+                buttons=None
+            )
+            try:
+                vid_bytes = await asyncio.to_thread(
+                    _generate_video_fal_sync,
+                    job["prompt_en"],
+                    job.get("image_bytes"),
+                    m_key,
+                    dur,
+                    True,
+                )
+                await asyncio.to_thread(
+                    record_video_generation,
+                    job["user_id"],
+                    job.get("username"),
+                    job["user_text"]
+                )
+                vid_file = io.BytesIO(vid_bytes)
+                vid_file.name = "video.mp4"
+                await client.send_file(
+                    job["chat_id"],
+                    vid_file,
+                    caption=f"🎬 Готово! (**{m_title}**, **{dur} сек**)",
+                    reply_to=job["reply_to"],
+                    supports_streaming=True,
+                )
+                await event.delete()
+            except Exception as ex:
+                await event.edit(f"❌ Не удалось сгенерировать видео: {ex}", buttons=None)
+            finally:
+                mark_generation_finished(job["user_id"])
+            return
+
+    draft_id = arg1
     msg_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else (event.message_id or 0)
     uid = draft_cache.get(draft_id) or event.sender_id
     if action == "edit":

@@ -9,14 +9,57 @@ from database import SessionLocal
 import models
 from env import FAL_KEY, OWNER_ID
 
-# Самые дешёвые и быстрые (warm-pool) модели на fal.ai с поддержкой генерации ровно 1 секунды:
-# 1) Основная: minimax/h3-max-turbo (~$0.016 за 1 сек при 480P)
-PRIMARY_T2V_MODEL = "minimax/h3-max-turbo/text-to-video"
-PRIMARY_I2V_MODEL = "minimax/h3-max-turbo/image-to-video"
+# Каталог доступных видео-моделей на fal.ai
+# Для обычных пользователей ВСЕГДА принудительно используется "minimax_turbo" и duration=1 (480P).
+# Админы могут выбирать любую модель и длительность (1..10 сек).
+VIDEO_MODELS = {
+    "minimax_turbo": {
+        "title": "⚡ Minimax Turbo (Слабая / Эконом)",
+        "short": "⚡ Minimax Turbo",
+        "t2v": "minimax/h3-max-turbo/text-to-video",
+        "i2v": "minimax/h3-max-turbo/image-to-video",
+        "durations": [1, 2, 3, 5, 8, 10],
+        "price_hint": "~$0.016/сек",
+    },
+    "grok_lite": {
+        "title": "🚀 Grok Video Lite (Быстрая)",
+        "short": "🚀 Grok Lite",
+        "t2v": "xai/grok-imagine-video/v1.5/lite/text-to-video",
+        "i2v": "xai/grok-imagine-video/v1.5/lite/image-to-video",
+        "durations": [1, 2, 3, 5, 8, 10],
+        "price_hint": "~$0.02/сек",
+    },
+    "pixverse_v6": {
+        "title": "🎨 PixVerse v6 (Креативная)",
+        "short": "🎨 PixVerse v6",
+        "t2v": "fal-ai/pixverse/v6/text-to-video",
+        "i2v": "fal-ai/pixverse/v6/image-to-video",
+        "durations": [1, 2, 3, 5, 8, 10],
+        "price_hint": "~$0.025/сек",
+    },
+    "minimax_max": {
+        "title": "🔥 Minimax H3 Max (Высокое качество)",
+        "short": "🔥 Minimax Max",
+        "t2v": "minimax/h3-max/text-to-video",
+        "i2v": "minimax/h3-max/image-to-video",
+        "durations": [1, 2, 3, 5, 8, 10],
+        "price_hint": "~$0.033/сек",
+    },
+    "kling_pro": {
+        "title": "👑 Kling 2.5 Turbo Pro (Кино-топ)",
+        "short": "👑 Kling 2.5 Pro",
+        "t2v": "fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
+        "i2v": "fal-ai/kling-video/v2.5-turbo/pro/image-to-video",
+        "durations": [5, 10],
+        "price_hint": "~$0.07/сек (только 5с / 10с)",
+    },
+}
 
-# 2) Резервная: xai/grok-imagine-video/v1.5/lite ($0.02 за 1 сек при 480p)
-FALLBACK_T2V_MODEL = "xai/grok-imagine-video/v1.5/lite/text-to-video"
-FALLBACK_I2V_MODEL = "xai/grok-imagine-video/v1.5/lite/image-to-video"
+DEFAULT_MODEL_KEY = "minimax_turbo"
+DEFAULT_DURATION_SEC = 1
+
+# Память последних настроек каждого админа в рамках работы бота: {user_id: {"model": str, "duration": int}}
+admin_video_prefs: dict[int, dict] = {}
 
 # Защита от одновременного запуска нескольких генераций одним пользователем
 _active_video_generations: set[int] = set()
@@ -97,7 +140,7 @@ def is_owner(user_id: int | None) -> bool:
 
 
 def is_video_admin(user_id: int | None, username: str | None = None) -> bool:
-    """Проверяет, есть ли у пользователя безлимитный доступ к генерации видео."""
+    """Проверяет, есть ли у пользователя безлимитный доступ и права выбора модели/секунд."""
     if is_owner(user_id):
         return True
 
@@ -127,6 +170,53 @@ def is_video_admin(user_id: int | None, username: str | None = None) -> bool:
                     db.rollback()
             return True
         return False
+
+
+def get_admin_prefs(user_id: int) -> dict:
+    prefs = admin_video_prefs.get(int(user_id))
+    if not prefs:
+        prefs = {"model": DEFAULT_MODEL_KEY, "duration": DEFAULT_DURATION_SEC}
+        admin_video_prefs[int(user_id)] = prefs
+    return prefs
+
+
+def set_admin_prefs(user_id: int, model_key: str | None = None, duration: int | None = None) -> dict:
+    prefs = get_admin_prefs(user_id)
+    if model_key and model_key in VIDEO_MODELS:
+        prefs["model"] = model_key
+        allowed_durs = VIDEO_MODELS[model_key]["durations"]
+        if prefs["duration"] not in allowed_durs:
+            prefs["duration"] = allowed_durs[0]
+    if duration is not None:
+        allowed_durs = VIDEO_MODELS[prefs["model"]]["durations"]
+        # Выбираем ближайшую поддерживаемую моделью длительность
+        closest = min(allowed_durs, key=lambda d: abs(d - int(duration)))
+        prefs["duration"] = closest
+    return prefs
+
+
+def extract_hints_from_text(text: str) -> tuple[str | None, int | None]:
+    """Извлекает подсказки по модели или длительности (в секундах) из текста запроса админа."""
+    low = (text or "").lower()
+    model_hint = None
+    if "kling" in low or "клинг" in low:
+        model_hint = "kling_pro"
+    elif "pixverse" in low or "пиксверс" in low:
+        model_hint = "pixverse_v6"
+    elif "grok" in low or "грок" in low:
+        model_hint = "grok_lite"
+    elif "max" in low or "макс" in low:
+        model_hint = "minimax_max"
+    elif "turbo" in low or "турбо" in low or "слаб" in low:
+        model_hint = "minimax_turbo"
+
+    dur_hint = None
+    m = re.search(r"\b(\d{1,2})\s*(?:сек|секунд|секунды|с\b|sec|seconds|s\b)", low)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= 15:
+            dur_hint = val
+    return model_hint, dur_hint
 
 
 def add_video_admins(raw_text: str) -> list[str]:
@@ -275,7 +365,62 @@ def mark_generation_finished(user_id: int):
     _active_video_generations.discard(int(user_id))
 
 
-def _run_fal_queue_job(model_id: str, payload: dict, headers: dict, max_wait_sec: int = 90) -> str:
+def _build_model_payload(model_key: str, prompt_en: str, duration_sec: int, data_uri: str | None) -> tuple[str, dict]:
+    info = VIDEO_MODELS.get(model_key, VIDEO_MODELS[DEFAULT_MODEL_KEY])
+    endpoint = info["i2v"] if data_uri else info["t2v"]
+    dur = int(duration_sec)
+
+    if model_key == "minimax_turbo":
+        payload = {
+            "prompt": prompt_en,
+            "duration": dur,
+            "resolution": "480P",
+            "prompt_expansion_mode": "disabled",
+            "enable_safety_checker": True,
+        }
+    elif model_key == "minimax_max":
+        payload = {
+            "prompt": prompt_en,
+            "duration": dur,
+            "resolution": "768P",
+            "prompt_expansion_mode": "balanced",
+            "enable_safety_checker": True,
+        }
+    elif model_key == "grok_lite":
+        payload = {
+            "prompt": prompt_en,
+            "duration": dur,
+            "resolution": "480p",
+            "enable_safety_checker": True,
+        }
+    elif model_key == "pixverse_v6":
+        payload = {
+            "prompt": prompt_en,
+            "duration": dur,
+            "resolution": "540p" if dur > 1 else "360p",
+            "enable_safety_checker": True,
+        }
+    elif model_key == "kling_pro":
+        kling_dur = "10" if dur >= 8 else "5"
+        payload = {
+            "prompt": prompt_en,
+            "duration": kling_dur,
+            "enable_safety_checker": True,
+        }
+    else:
+        payload = {
+            "prompt": prompt_en,
+            "duration": 1,
+            "resolution": "480P",
+            "enable_safety_checker": True,
+        }
+
+    if data_uri:
+        payload["image_url"] = data_uri
+    return endpoint, payload
+
+
+def _run_fal_queue_job(model_id: str, payload: dict, headers: dict, max_wait_sec: int = 120) -> str:
     """
     Отправляет задачу в асинхронную очередь queue.fal.run и опрашивает статус каждые 2.5 сек,
     чтобы соединение никогда не зависало по ReadTimeout. Возвращает URL готового видео.
@@ -286,7 +431,6 @@ def _run_fal_queue_job(model_id: str, payload: dict, headers: dict, max_wait_sec
         raise RuntimeError(f"Ошибка запуска ({sub_resp.status_code}): {sub_resp.text[:300]}")
 
     sub_data = sub_resp.json()
-    # Если ответ пришёл синхронно сразу с видео
     if isinstance(sub_data.get("video"), dict) and sub_data["video"].get("url"):
         return sub_data["video"]["url"]
 
@@ -311,12 +455,11 @@ def _run_fal_queue_job(model_id: str, payload: dict, headers: dict, max_wait_sec
             res_data = res_resp.json()
             video_url = (res_data.get("video") or {}).get("url")
             if not video_url:
-                raise RuntimeError(f"fal.ai не вернул ссылку на видео (возможно, сработал фильтр безопасности).")
+                raise RuntimeError("fal.ai не вернул ссылку на видео (возможно, сработал фильтр безопасности).")
             return video_url
         if status in ("FAILED", "ERROR", "CANCELLED"):
             raise RuntimeError(f"Генерация отклонена или завершилась ошибкой: {str(st_json)[:250]}")
 
-    # Если превысили лимит ожидания — отменяем задачу, чтобы не списались деньги
     if cancel_url:
         try:
             requests.put(cancel_url, headers=headers, timeout=10)
@@ -325,10 +468,21 @@ def _run_fal_queue_job(model_id: str, payload: dict, headers: dict, max_wait_sec
     raise TimeoutError(f"Модель {model_id} слишком долго в очереди (> {max_wait_sec} сек)")
 
 
-def _generate_video_fal_sync(prompt_en: str, image_bytes: bytes | None = None) -> bytes:
+def _generate_video_fal_sync(
+    prompt_en: str,
+    image_bytes: bytes | None = None,
+    model_key: str = DEFAULT_MODEL_KEY,
+    duration_sec: int = DEFAULT_DURATION_SEC,
+    is_admin_req: bool = False,
+) -> bytes:
     api_key = get_fal_key()
     if not api_key:
         raise RuntimeError("Ключ FAL_KEY не задан в настройках (.env / Render Environment).")
+
+    # Жёсткая защита: если пользователь НЕ админ — принудительно только самая слабая модель и 1 секунда!
+    if not is_admin_req:
+        model_key = DEFAULT_MODEL_KEY
+        duration_sec = DEFAULT_DURATION_SEC
 
     headers = {
         "Authorization": f"Key {api_key}",
@@ -341,34 +495,19 @@ def _generate_video_fal_sync(prompt_en: str, image_bytes: bytes | None = None) -
         b64_img = base64.b64encode(image_bytes).decode("ascii")
         data_uri = f"data:image/jpeg;base64,{b64_img}"
 
-    # 1) Пробуем самую дешёвую и быструю модель: minimax/h3-max-turbo (1 сек, 480P, ~$0.016)
-    primary_model = PRIMARY_I2V_MODEL if data_uri else PRIMARY_T2V_MODEL
-    primary_payload = {
-        "prompt": clean_prompt,
-        "duration": 1,
-        "resolution": "480P",
-        "prompt_expansion_mode": "disabled",
-        "enable_safety_checker": True,
-    }
-    if data_uri:
-        primary_payload["image_url"] = data_uri
+    endpoint, payload = _build_model_payload(model_key, clean_prompt, duration_sec, data_uri)
+    wait_limit = 180 if (is_admin_req and (duration_sec > 2 or model_key in ("kling_pro", "minimax_max"))) else 80
 
     video_url = None
     try:
-        video_url = _run_fal_queue_job(primary_model, primary_payload, headers, max_wait_sec=75)
+        video_url = _run_fal_queue_job(endpoint, payload, headers, max_wait_sec=wait_limit)
     except Exception as primary_err:
-        print(f"[FAL] Primary model ({primary_model}) fallback: {primary_err}")
-        # 2) Резервная быстрая модель: xai/grok-imagine-video/v1.5/lite (1 сек, 480p, $0.02)
-        fallback_model = FALLBACK_I2V_MODEL if data_uri else FALLBACK_T2V_MODEL
-        fallback_payload = {
-            "prompt": clean_prompt,
-            "duration": 1,
-            "resolution": "480p",
-            "enable_safety_checker": True,
-        }
-        if data_uri:
-            fallback_payload["image_url"] = data_uri
-        video_url = _run_fal_queue_job(fallback_model, fallback_payload, headers, max_wait_sec=90)
+        # Авто-фоллбэк на резервную модель того же уровня длительности, если основная очередь перегружена
+        fallback_key = "grok_lite" if model_key != "grok_lite" else "minimax_turbo"
+        fallback_dur = duration_sec if is_admin_req else 1
+        print(f"[FAL] Primary model ({endpoint}) error: {primary_err}. Falling back to {fallback_key} ({fallback_dur}s)")
+        fb_endpoint, fb_payload = _build_model_payload(fallback_key, clean_prompt, fallback_dur, data_uri)
+        video_url = _run_fal_queue_job(fb_endpoint, fb_payload, headers, max_wait_sec=100)
 
     vid_resp = requests.get(video_url, timeout=60)
     vid_resp.raise_for_status()
