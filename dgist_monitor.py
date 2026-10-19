@@ -137,12 +137,24 @@ def summarize_with_gemini(title: str, text: str, category: str) -> dict:
         print(f"[GEMINI] Warning: {e}, using preview fallback")
         return {"important": True, "summary": preview}
 
-def run_once(cookie: str = "", state_file: str = STATE_FILE, log_file: str = LOG_FILE) -> dict:
+def run_once(
+    cookie: str = "",
+    state_file: str = STATE_FILE,
+    log_file: str = LOG_FILE,
+    uid: int | None = None,
+) -> dict:
+    from dgist_accounts import load_dgist_seen_ids, save_dgist_seen_ids, save_dgist_session
     if not cookie: raise RuntimeError("Не передана session cookie для DGIST.")
     session = requests.Session()
     session.headers.update(HEADERS)
     session.headers["Cookie"] = cookie
-    seen = load_seen(state_file)
+
+    seen = load_dgist_seen_ids(uid) if uid else {}
+    if not seen:
+        seen = load_seen(state_file)
+        if seen and uid:
+            save_dgist_seen_ids(uid, seen)
+
     is_first = not bool(seen)
     new_imp, new_min, processed_titles = [], [], set()
 
@@ -170,7 +182,9 @@ def run_once(cookie: str = "", state_file: str = STATE_FILE, log_file: str = LOG
             try:
                 detail = fetch_detail(session, menu_key, board_id, pid)
             except SessionExpiredError as e:
-                seen[menu_key] = list(ex_ids); save_seen(seen, state_file)
+                seen[menu_key] = list(ex_ids)
+                if uid: save_dgist_seen_ids(uid, seen)
+                save_seen(seen, state_file)
                 return {"new_important": new_imp, "new_minor": new_min, "digest_top10": [], "error": str(e)}
             except Exception as e:
                 print(f"[DETAIL ERROR] post={pid}: {e}")
@@ -187,16 +201,31 @@ def run_once(cookie: str = "", state_file: str = STATE_FILE, log_file: str = LOG
             ex_ids.add(pid)
         seen[menu_key] = list(ex_ids)
 
+    if uid:
+        save_dgist_seen_ids(uid, seen)
+        # Если сервер обновил куки в ходе ответа, сохраняем актуальную куку в БД
+        if session.cookies:
+            merged = {k.strip(): v.strip() for part in cookie.split(";") if "=" in part for k, v in [part.split("=", 1)]}
+            for ck in session.cookies:
+                merged[ck.name] = ck.value
+            new_cookie_str = "; ".join(f"{k}={v}" for k, v in merged.items())
+            save_dgist_session(uid, session_cookie=new_cookie_str)
     save_seen(seen, state_file)
     return {"new_important": new_imp, "new_minor": new_min, "digest_top10": [], "error": None}
 
 def run_once_for_user(uid: int, dgist_cookie=None) -> dict:
+    from dgist_accounts import load_dgist_session, save_dgist_session
     paths = build_user_paths(uid)
     cookie = dgist_cookie if isinstance(dgist_cookie, str) else ""
+    if not cookie:
+        cookie = load_dgist_session(uid).get("session_cookie", "")
     if not cookie and os.path.exists(paths["cookie_file"]):
-        with open(paths["cookie_file"], "r", encoding="utf-8") as f: cookie = f.read().strip()
+        with open(paths["cookie_file"], "r", encoding="utf-8") as f:
+            cookie = f.read().strip()
+        if cookie:
+            save_dgist_session(uid, session_cookie=cookie)
     if not cookie: raise RuntimeError(f"Не найдена cookie для пользователя {uid}")
-    return run_once(cookie=cookie, state_file=paths["state_file"], log_file=paths["log_file"])
+    return run_once(cookie=cookie, state_file=paths["state_file"], log_file=paths["log_file"], uid=uid)
 
 if __name__ == "__main__":
     c_file = os.path.join(BASE_DIR, "session_cookie.txt")

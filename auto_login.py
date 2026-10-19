@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""DGIST Auto-Login с 2FA через почту (Playwright) — конденсированная версия."""
+"""DGIST Auto-Login с 2FA через почту (Playwright) и сохранением сессии напрямую в БД."""
 import os, sys, time, re, imaplib, email
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
+from dgist_accounts import load_dgist_session, save_dgist_session
 
 load_dotenv()
 
@@ -98,7 +99,7 @@ def open_ecm(page) -> bool:
             if "stuecm.dgist.ac.kr" in page.url and "isign" not in page.url: return True
     return False
 
-def save_cookies(context, out_file: str) -> str:
+def extract_cookie_string(context, out_file: str | None = None) -> str:
     cookies = context.cookies()
     seen = set()
     parts = []
@@ -109,23 +110,53 @@ def save_cookies(context, out_file: str) -> str:
                 seen.add(key)
                 parts.append(f"{c['name']}={c['value']}")
     cookie_str = "; ".join(parts)
-    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
-    with open(out_file, "w", encoding="utf-8") as f: f.write(cookie_str)
+    if out_file:
+        try:
+            os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
+            with open(out_file, "w", encoding="utf-8") as f:
+                f.write(cookie_str)
+        except Exception:
+            pass
     return cookie_str
 
-def login_and_get_cookie(dgist_user, dgist_pass, email_addr, email_pass, profile_dir, cookie_file, imap_host="imap.gmail.com"):
+def login_and_get_cookie(
+    dgist_user,
+    dgist_pass,
+    email_addr,
+    email_pass,
+    profile_dir=None,
+    cookie_file=None,
+    imap_host="imap.gmail.com",
+    telegram_user_id: int | None = None,
+):
+    saved_sess = load_dgist_session(telegram_user_id) if telegram_user_id else {"storage_state": None}
+    storage_state = saved_sess.get("storage_state")
+
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            profile_dir, headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        # Облегчённый запуск браузера в памяти (без создания тяжёлой папки профиля на диске)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--no-zygote",
+            ],
         )
+        ctx_kwargs = {}
+        if isinstance(storage_state, dict) and storage_state.get("cookies"):
+            ctx_kwargs["storage_state"] = storage_state
+        ctx = browser.new_context(**ctx_kwargs)
         try:
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page = ctx.new_page()
             page.goto(PORTAL_LOGIN_URL, wait_until="networkidle", timeout=60000)
             try:
                 page.wait_for_selector(USER_MARKER, timeout=5000)
                 alive = True
-            except Exception: alive = False
+            except Exception:
+                alive = False
 
             if not alive:
                 page.fill(USERNAME_SEL, dgist_user)
@@ -144,10 +175,20 @@ def login_and_get_cookie(dgist_user, dgist_pass, email_addr, email_pass, profile
             if not open_ecm(page):
                 raise RuntimeError(f"Не удалось открыть ECM: {page.url}")
 
-            return save_cookies(ctx, cookie_file)
+            cookie_str = extract_cookie_string(ctx, cookie_file)
+            new_storage_state = ctx.storage_state()
+            if telegram_user_id:
+                save_dgist_session(telegram_user_id, session_cookie=cookie_str, storage_state=new_storage_state)
+            return cookie_str
         finally:
-            try: ctx.close()
-            except Exception: pass
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 def login_for_telegram_user(
     telegram_user_id: int = None,
@@ -163,9 +204,7 @@ def login_for_telegram_user(
     pw = dgist_password or kwargs.get("dgist_pass")
     em = email_address or kwargs.get("email_addr")
     ep = email_app_password or kwargs.get("email_pass")
-    from dgist_monitor import build_user_paths
-    p = build_user_paths(uid)
-    return login_and_get_cookie(u, pw, em, ep, p["browser_profile_dir"], p["cookie_file"], imap_host)
+    return login_and_get_cookie(u, pw, em, ep, imap_host=imap_host, telegram_user_id=uid)
 
 if __name__ == "__main__":
     u, p = os.getenv("DGIST_USERNAME"), os.getenv("DGIST_PASSWORD")

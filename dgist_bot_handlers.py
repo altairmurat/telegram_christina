@@ -1,7 +1,11 @@
 import asyncio, json, os, sys, subprocess, traceback
 from telethon import events
 import dgist_monitor
-from dgist_accounts import save_dgist_account, load_dgist_account, delete_dgist_account, list_dgist_user_ids
+from dgist_accounts import (
+    save_dgist_account, load_dgist_account, delete_dgist_account, list_dgist_user_ids,
+    load_dgist_session, save_dgist_session, load_dgist_seen_ids,
+    save_dgist_group_target, load_dgist_group_target, get_dgist_last_check_age_sec
+)
 
 _active_portal_checks = set()
 AUTO_CHECK_INTERVAL_SEC = 33 * 60 * 60
@@ -18,19 +22,30 @@ def remember_group_topic(event):
     if event.is_private:
         return
     tid = get_topic_id(event)
+    target = {"chat_id": event.chat_id, "topic_id": tid}
+    try:
+        save_dgist_group_target(target)
+    except Exception:
+        pass
     os.makedirs("user_data", exist_ok=True)
     try:
         with open(GROUP_TARGET_FILE, "w", encoding="utf-8") as f:
-            json.dump({"chat_id": event.chat_id, "topic_id": tid}, f)
+            json.dump(target, f)
     except Exception:
         pass
 
 def load_group_target() -> dict | None:
+    db_target = load_dgist_group_target()
+    if db_target and db_target.get("chat_id"):
+        return db_target
     if not os.path.exists(GROUP_TARGET_FILE):
         return None
     try:
         with open(GROUP_TARGET_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if data:
+            save_dgist_group_target(data)
+        return data
     except Exception:
         return None
 
@@ -101,16 +116,28 @@ def register_dgist_handlers(client, user_states: dict):
 
 async def _check_user_portal(uid: int, account: dict) -> dict:
     paths = dgist_monitor.build_user_paths(uid)
-    cookie = ""
-    if os.path.exists(paths["cookie_file"]):
-        with open(paths["cookie_file"], "r", encoding="utf-8") as f: cookie = f.read().strip()
+    sess = await asyncio.to_thread(load_dgist_session, uid)
+    cookie = (sess.get("session_cookie") or "").strip()
+
+    # Миграция из локального файла, если в БД ещё пусто
+    if not cookie and os.path.exists(paths["cookie_file"]):
+        with open(paths["cookie_file"], "r", encoding="utf-8") as f:
+            cookie = f.read().strip()
+        if cookie:
+            await asyncio.to_thread(save_dgist_session, uid, cookie)
+
     if cookie:
         res = await asyncio.to_thread(dgist_monitor.run_once_for_user, uid, cookie)
-        if res and not _result_has_session_error(res): return res
+        if res and not _result_has_session_error(res):
+            return res
         print(f"[AUTO] Cookie пользователя {uid} истекла, перелогиниваюсь...")
 
     await asyncio.to_thread(_run_login_subprocess, uid, account)
-    with open(paths["cookie_file"], "r", encoding="utf-8") as f: cookie = f.read().strip()
+    sess_after = await asyncio.to_thread(load_dgist_session, uid)
+    cookie = (sess_after.get("session_cookie") or "").strip()
+    if not cookie and os.path.exists(paths["cookie_file"]):
+        with open(paths["cookie_file"], "r", encoding="utf-8") as f:
+            cookie = f.read().strip()
     return await asyncio.to_thread(dgist_monitor.run_once_for_user, uid, cookie)
 
 def _result_has_session_error(res: dict) -> bool:
@@ -142,17 +169,23 @@ def _format_new_posts_messages(res: dict) -> list[str]:
     return msgs
 
 async def _auto_monitor_loop(client):
-    await asyncio.sleep(5)
+    await asyncio.sleep(10)
     while True:
         try:
             for uid in await asyncio.to_thread(list_dgist_user_ids):
                 if uid in _active_portal_checks: continue
+                # Если в БД уже есть свежая проверка (< 33 часов назад), не дёргаем портал при каждом редеплое Render!
+                age_sec = await asyncio.to_thread(get_dgist_last_check_age_sec, uid)
+                if age_sec is not None and age_sec < AUTO_CHECK_INTERVAL_SEC:
+                    continue
+
                 acc = await asyncio.to_thread(load_dgist_account, uid)
                 if not acc: continue
                 _active_portal_checks.add(uid)
                 try:
+                    db_seen = await asyncio.to_thread(load_dgist_seen_ids, uid)
                     p = dgist_monitor.build_user_paths(uid)
-                    is_first = not os.path.exists(p["state_file"])
+                    is_first = not bool(db_seen) and not os.path.exists(p["state_file"])
                     res = await _check_user_portal(uid, acc)
                     if not is_first and not res.get("error"):
                         posts = list(res.get("new_important", [])) + list(res.get("new_minor", []))
@@ -160,7 +193,7 @@ async def _auto_monitor_loop(client):
                             formatted = _format_new_posts_messages(res)
                             for m in formatted:
                                 await client.send_message(uid, m, link_preview=False)
-                            gt = load_group_target()
+                            gt = await asyncio.to_thread(load_group_target)
                             if gt and gt.get("chat_id") and gt.get("chat_id") != uid:
                                 for m in formatted:
                                     await client.send_message(gt["chat_id"], m, reply_to=gt.get("topic_id"), link_preview=False)
@@ -170,7 +203,8 @@ async def _auto_monitor_loop(client):
                     _active_portal_checks.discard(uid)
         except Exception:
             traceback.print_exc()
-        await asyncio.sleep(AUTO_CHECK_INTERVAL_SEC)
+        # Проверяем раз в час, кому из пользователей пора делать 33-часовую проверку
+        await asyncio.sleep(3600)
 
 def _run_login_subprocess(uid: int, account: dict):
     if not account or not account.get("dgist_password") or not account.get("email_app_password"):

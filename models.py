@@ -96,3 +96,14 @@ class VideoGenerationLog(Base):
     username = Column(String, index=True, nullable=True)
     prompt = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+class DgistSessionState(Base):
+    __tablename__ = "dgist_session_states"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id = Column(BigInteger, unique=True, index=True)
+    session_cookie = Column(Text, nullable=True)       # кука для HTTP-запросов stuecm.dgist.ac.kr
+    storage_state_json = Column(Text, nullable=True)   # полное состояние сессии Playwright (SSO куки в БД вместо тяжелой папки профиля)
+    seen_ids_json = Column(Text, nullable=True)        # JSON со списком уже просмотренных объявлений
+    group_target_json = Column(Text, nullable=True)    # JSON активного топика группы для авто-уведомлений
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
