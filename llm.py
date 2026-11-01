@@ -43,60 +43,49 @@ def format_portal_posts_for_context(posts: list[dict]) -> str:
 
 def store_portal_context(user_id: int | None, posts: list[dict]) -> None:
     """Сохраняет вытащенные объявления с портала (включая полный текст и ссылки на регистрацию) в контекст пользователя."""
-    if not posts:
+    if not posts or not user_id:
         return
     ctx_text = format_portal_posts_for_context(posts)
     if not ctx_text:
         return
-    uid = int(user_id) if user_id is not None else 0
+    uid = int(user_id)
     portal_context_store[uid] = ctx_text
-    portal_context_store[0] = ctx_text
-    if user_id is not None:
-        hist = user_contexts[user_id]
-        summary_lines = [
-            f"#{i}. [{p.get('category', 'DGIST')}] {p.get('title', '')} — {p.get('summary', '')}"
-            for i, p in enumerate(posts[:15], 1)
-        ]
-        hist.append(
-            types.Content(
-                role="model",
-                parts=[
-                    types.Part.from_text(
-                        text=(
-                            "[Выгружены объявления с портала DGIST в журнал и сохранены в память со всеми ссылками и полным текстом:]\n"
-                            + "\n".join(summary_lines)
-                        )
+    hist = user_contexts[uid]
+    summary_lines = [
+        f"#{i}. [{p.get('category', 'DGIST')}] {p.get('title', '')} — {p.get('summary', '')}"
+        for i, p in enumerate(posts[:15], 1)
+    ]
+    hist.append(
+        types.Content(
+            role="model",
+            parts=[
+                types.Part.from_text(
+                    text=(
+                        "[Выгружены объявления с портала DGIST в журнал и сохранены в память со всеми ссылками и полным текстом:]\n"
+                        + "\n".join(summary_lines)
                     )
-                ],
-            )
+                )
+            ],
         )
+    )
 
 def _get_portal_context_for_user(user_id: int | None) -> str:
-    uid = int(user_id) if user_id is not None else 0
-    ctx = portal_context_store.get(uid) or portal_context_store.get(0)
+    if not user_id:
+        return ""
+    uid = int(user_id)
+    ctx = portal_context_store.get(uid)
     if ctx:
         return ctx
     try:
-        from dgist_accounts import load_dgist_seen_ids, list_dgist_user_ids
-        target_uid = uid if uid else None
-        if not target_uid:
-            uids = list_dgist_user_ids()
-            target_uid = uids[0] if uids else None
-        if target_uid:
-            seen = load_dgist_seen_ids(target_uid)
-            recent = seen.get("__recent_posts__", []) if isinstance(seen, dict) else []
-            if not recent:
-                uids = list_dgist_user_ids()
-                for u in uids:
-                    s2 = load_dgist_seen_ids(u)
-                    if isinstance(s2, dict) and s2.get("__recent_posts__"):
-                        recent = s2["__recent_posts__"]
-                        break
-            if recent:
-                ctx = format_portal_posts_for_context(recent)
-                portal_context_store[uid] = ctx
-                portal_context_store[0] = ctx
-                return ctx
+        from dgist_accounts import load_dgist_seen_ids, get_dgist_creds
+        if not get_dgist_creds(uid):
+            return ""
+        seen = load_dgist_seen_ids(uid)
+        recent = seen.get("__recent_posts__", []) if isinstance(seen, dict) else []
+        if recent:
+            ctx = format_portal_posts_for_context(recent)
+            portal_context_store[uid] = ctx
+            return ctx
     except Exception:
         pass
     return ""
@@ -127,27 +116,30 @@ def format_everytime_posts_for_context(posts: list[dict]) -> str:
 
 
 def store_everytime_context(user_id: int | None, posts: list[dict]):
-    if not posts:
+    if not posts or not user_id:
         return
     formatted = format_everytime_posts_for_context(posts)
-    uid = int(user_id) if user_id is not None else 0
+    uid = int(user_id)
     everytime_context_store[uid] = formatted
-    everytime_context_store[0] = formatted
 
 
 def _get_everytime_context_for_user(user_id: int | None) -> str:
-    uid = int(user_id) if user_id is not None else 0
-    ctx = everytime_context_store.get(uid) or everytime_context_store.get(0)
-    if ctx:
-        return ctx
+    if not user_id:
+        return ""
+    uid = int(user_id)
     try:
-        from everytime_monitor import load_everytime_seen_data
+        from everytime_monitor import load_everytime_cookie, load_everytime_seen_data
+        # Если у пользователя нет собственной подключённой куки Everytime — контекст недоступен
+        if not load_everytime_cookie(uid):
+            return ""
+        ctx = everytime_context_store.get(uid)
+        if ctx:
+            return ctx
         seen = load_everytime_seen_data(uid)
         last_posts = (seen or {}).get("last_magazine_posts") or []
         if last_posts:
             ctx = format_everytime_posts_for_context(last_posts)
             everytime_context_store[uid] = ctx
-            everytime_context_store[0] = ctx
             return ctx
     except Exception:
         pass

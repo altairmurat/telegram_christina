@@ -146,8 +146,9 @@ async def run_everytime_command(event, mode: str = "keywords", custom_query: str
     cookie = await asyncio.to_thread(etm.load_everytime_cookie, uid)
     if not cookie:
         await event.reply(
-            "🔑 **Everytime ещё не подключён!**\n\n"
-            "Нажми /connecteverytime — подключение занимает 10 секунд через твой открытый браузер (без паролей и reCAPTCHA)."
+            "⛔ **Доступ запрещён!**\n\n"
+            "У тебя не подключён личный аккаунт DGIST Everytime.\n"
+            "Каждый пользователь работает только со своей личной сессией — нажми /connecteverytime и подключи свою куку `etsid`."
         )
         return
 
@@ -200,7 +201,9 @@ async def handle_everytime_url_in_message(event, text: str) -> bool:
     uid = event.sender_id
     cookie = await asyncio.to_thread(etm.load_everytime_cookie, uid)
     if not cookie:
-        await event.reply("🔑 Чтобы я могла открывать и переводить ссылки Everytime, подключи куку через /connecteverytime")
+        await event.reply(
+            "⛔ **Доступ запрещён!** Чтобы открывать и переводить ссылки Everytime, подключи свой личный аккаунт через /connecteverytime"
+        )
         return True
 
     st = await event.reply(f"🔄 Загружаю пост `#{article_id}` и комментарии с Everytime, перевожу слово в слово...")
@@ -274,6 +277,13 @@ def register_everytime_handlers(client, user_states: dict):
     @client.on(events.NewMessage(pattern=r"(?i)^/etkeywords(@\w+)?(?:\s+([\s\S]*))?$"))
     async def et_keywords_cmd(e):
         uid = e.sender_id
+        cookie = await asyncio.to_thread(etm.load_everytime_cookie, uid)
+        if not cookie:
+            await e.reply(
+                "⛔ **Доступ запрещён!**\n"
+                "У тебя не подключён личный аккаунт Everytime. Сначала подключи свою куку через /connecteverytime"
+            )
+            return
         arg = (e.pattern_match.group(2) or "").strip()
         cur_kws = await asyncio.to_thread(etm.get_everytime_keywords, uid)
 
@@ -312,6 +322,15 @@ def register_everytime_handlers(client, user_states: dict):
 
     @client.on(events.CallbackQuery(pattern=rb"^etmag:"))
     async def handle_et_magazine_callback(event):
+        uid = event.sender_id
+        cookie = await asyncio.to_thread(etm.load_everytime_cookie, uid)
+        if not cookie:
+            await event.answer(
+                "⛔ Доступ запрещён! Подключи свой личный аккаунт Everytime через /connecteverytime",
+                alert=True,
+            )
+            return
+
         data = event.data.decode("utf-8", errors="ignore")
         if data == "etmag:noop":
             await event.answer("Листай страницы кнопками ⬅️ Назад / Вперёд ➡️")
@@ -323,8 +342,14 @@ def register_everytime_handlers(client, user_states: dict):
         _, subaction, mag_id, val = parts[0], parts[1], parts[2], parts[3]
 
         mag = everytime_magazines.get(mag_id)
+        if mag and mag.get("uid") and mag.get("uid") != uid:
+            await event.answer(
+                "⛔ Это журнал другого пользователя. Вызови свой журнал командой /everytime!",
+                alert=True,
+            )
+            return
+
         if not mag:
-            uid = event.sender_id
             seen_data = await asyncio.to_thread(etm.load_everytime_seen_data, uid)
             last_posts = seen_data.get("last_magazine_posts") or []
             if not last_posts:
@@ -344,7 +369,7 @@ def register_everytime_handlers(client, user_states: dict):
                 page = int(val)
             except ValueError:
                 return
-            store_everytime_context(event.sender_id, mag["posts"])
+            store_everytime_context(uid, mag["posts"])
             text, buttons = format_et_magazine_page(mag, page)
             try:
                 await event.edit(text, buttons=buttons, link_preview=False)
@@ -356,13 +381,12 @@ def register_everytime_handlers(client, user_states: dict):
         if subaction == "mode":
             target_mode = val if val in ("keywords", "all") else "keywords"
             await event.answer("Загружаю и перевожу посты...")
-            uid = mag.get("uid") or event.sender_id
             try:
                 await event.edit("🔄 Переключаю режим и перевожу свежие посты с Everytime...", buttons=None)
                 res = await asyncio.to_thread(etm.run_everytime_check, uid, target_mode, "")
                 posts = res.get("posts") or []
                 kws = res.get("keywords") or []
-                store_everytime_context(event.sender_id, posts)
+                store_everytime_context(uid, posts)
                 if target_mode == "all":
                     header = "🔥 **DGIST Everytime — вся свежая лента (перевод слово в слово):**"
                 else:

@@ -94,19 +94,23 @@ def save_everytime_cookie(uid: int, raw_cookie: str) -> str:
 
 
 def load_everytime_cookie(uid: int | None = None) -> str:
+    """
+    Возвращает куку Everytime СТРОГО только для конкретного пользователя uid.
+    Чужие куки или общие фоллбеки никогда не используются.
+    """
+    if not uid:
+        return ""
     with SessionLocal() as db:
-        st = None
-        if uid:
-            st = db.query(models.EverytimeState).filter_by(telegram_user_id=uid).first()
-        if not st or not st.session_cookie:
-            st = db.query(models.EverytimeState).filter(models.EverytimeState.session_cookie.isnot(None)).first()
+        st = db.query(models.EverytimeState).filter_by(telegram_user_id=int(uid)).first()
         if st and st.session_cookie:
-            try:
-                return decrypt_str(st.session_cookie)
-            except Exception:
-                return st.session_cookie
-    env_ck = os.getenv("EVERYTIME_COOKIE") or os.getenv("ETSID") or ""
-    return normalize_everytime_cookie(env_ck)
+            raw = st.session_cookie.strip()
+            if raw.startswith("gAAAA"):
+                try:
+                    return decrypt_str(raw) or ""
+                except Exception:
+                    return raw
+            return normalize_everytime_cookie(raw)
+    return ""
 
 
 def list_everytime_user_ids() -> list[int]:
@@ -148,10 +152,10 @@ def set_everytime_keywords(uid: int, keywords: list[str]) -> list[str]:
 
 
 def load_everytime_seen_data(uid: int) -> dict:
+    if not uid:
+        return {"seen_ids": [], "cached_posts": {}, "last_magazine_posts": []}
     with SessionLocal() as db:
-        st = db.query(models.EverytimeState).filter_by(telegram_user_id=uid).first()
-        if not st:
-            st = db.query(models.EverytimeState).first()
+        st = db.query(models.EverytimeState).filter_by(telegram_user_id=int(uid)).first()
         if st and st.seen_ids_json:
             try:
                 data = json.loads(st.seen_ids_json)
