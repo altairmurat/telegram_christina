@@ -116,3 +116,13 @@ class ShakRelay(Base):
     recipient_chat_id = Column(BigInteger, index=True)
     message_id = Column(BigInteger, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class EverytimeState(Base):
+    __tablename__ = "everytime_states"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id = Column(BigInteger, unique=True, index=True)
+    session_cookie = Column(Text, nullable=True)       # кука etsid (или полная строка Cookie от everytime.kr)
+    keywords_json = Column(Text, nullable=True)        # JSON-список ключевых слов пользователя
+    seen_ids_json = Column(Text, nullable=True)        # JSON с просмотренными ID постов и кэшем последних переводов
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)

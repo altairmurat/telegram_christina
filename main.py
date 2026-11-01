@@ -24,6 +24,10 @@ from dgist_bot_handlers import (
     register_dgist_handlers, handle_dgist_conversation_step,
     run_portal_check, remember_group_topic, is_active_group_topic
 )
+from everytime_bot_handlers import (
+    register_everytime_handlers, handle_everytime_conversation_step,
+    run_everytime_command, handle_everytime_url_in_message
+)
 from group_memory import (
     record_group_message, search_group_messages, list_known_topics,
     format_messages_for_prompt, get_default_chat_id
@@ -414,6 +418,8 @@ async def handle_video_generation(
         await status.edit(f"❌ Не удалось сгенерировать видео: {ex}")
 
 async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
+    if await handle_everytime_url_in_message(event, text):
+        return True
     intent = await parse_user_intent(text)
     if intent.is_video:
         sender = await event.get_sender()
@@ -423,6 +429,11 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
 
     if intent.is_portal:
         await run_portal_check(event)
+        return True
+
+    if intent.is_everytime:
+        q = (intent.everytime_query or "").strip()
+        await run_everytime_command(event, mode="custom" if q else "keywords", custom_query=q)
         return True
 
     if intent.is_group_query:
@@ -616,8 +627,8 @@ async def on_callback(event):
     parts = data.split(":")
     action, arg1 = parts[0], parts[1] if len(parts) > 1 else ""
 
-    # Кнопки пагинации журнала DGIST обрабатываются в dgist_bot_handlers
-    if action == "dgmag":
+    # Кнопки пагинации журналов DGIST и Everytime обрабатываются в своих модулях
+    if action in ("dgmag", "etmag"):
         return
 
     # Кнопки Antigravity (выход из режима и откат коммита)
@@ -756,6 +767,7 @@ async def startup_event():
     except Exception as e: print(f"DB init error: {e}")
     await client.start(bot_token=BOT_TOKEN)
     register_dgist_handlers(client, user_states)
+    register_everytime_handlers(client, user_states)
     asyncio.create_task(run_reminder_worker(client))
     try:
         await client(functions.bots.SetBotCommandsRequest(
@@ -763,12 +775,15 @@ async def startup_event():
             lang_code="",
             commands=[
                 types.BotCommand("help", "Все возможности и команды"),
-                types.BotCommand("calendar", "Ближайшие планы в Google Календаре"),
-                types.BotCommand("connectgoogle", "Подключить Google (Календарь и Gmail)"),
-                types.BotCommand("topics", "Список отслеживаемых топиков"),
+                types.BotCommand("everytime", "Журнал постов DGIST Everytime с переводом"),
+                types.BotCommand("etkeywords", "Ключевые слова для фильтра Everytime"),
+                types.BotCommand("connecteverytime", "Подключить DGIST Everytime"),
                 types.BotCommand("checkportal", "Проверить объявления DGIST"),
                 types.BotCommand("connectmyportal", "Подключить портал DGIST"),
                 types.BotCommand("disconnectportal", "Отключить портал DGIST"),
+                types.BotCommand("calendar", "Ближайшие планы в Google Календаре"),
+                types.BotCommand("connectgoogle", "Подключить Google (Календарь и Gmail)"),
+                types.BotCommand("topics", "Список отслеживаемых топиков"),
                 types.BotCommand("antigravity", "Режим самоулучшения Antigravity (Owner)"),
                 types.BotCommand("cancel", "Отменить действие"),
             ]
@@ -824,20 +839,24 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 📌 **Команды:**
 • /help — список возможностей
-• /calendar — ближайшие планы в календаре
-• /connectgoogle — подключить Google (Календарь и Gmail)
-• /topics — список топиков в группе
+• /everytime — журнал постов с DGIST Everytime (с переводом слово в слово)
+• /etkeywords — ключевые слова для фильтрации Everytime
+• /connecteverytime — подключить DGIST Everytime
 • /checkportal — проверить объявления DGIST
 • /connectmyportal — подключить портал DGIST (в ЛС)
 • /disconnectportal — отключить портал DGIST
+• /calendar — ближайшие планы в календаре
+• /connectgoogle — подключить Google (Календарь и Gmail)
+• /topics — список топиков в группе
 • /cancel — отменить текущее действие
 
 ✨ **Возможности (просто напиши или скажи голосом):**
 • 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
+• 🇰🇷 **Парсер DGIST Everytime** — напиши *«чекни еверитайм»*, используй /everytime или скинь прямую ссылку `everytime.kr/393752/v/...`, и я выдам журнал постов по ключевым словам (`foreigner`, `외국인`, `201`, `기숙사`, `dormitory` и др.) с дословным переводом слово в слово и комментариями!
 • 🎬 **Генерация видео** — напиши *«Сгенерируй видео на тему...»* или отправь фото с подписью *«Сгенерируй видео на...»*, и я создам короткий видеоролик (доступно 1 видео в день).
 • 📅 **Google Календарь и напоминания** — напиши, например: *«Запиши в календарь: сегодня в 19:00 созвон, это оч важно, напомни»* или *«Что у меня по планам?»* — я добавлю событие в календарь, настрою push-уведомления и пришлю напоминание прямо в Telegram!
 • 📂 **Поиск по топикам группы** — напиши *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.
-• 🎓 **Объявления DGIST** — напиши *«чекни портал»* или *«что нового на портале»*, и я пришлю свежие новости.
+• 🎓 **Объявления DGIST** — напиши *«чекни портал»* или *«что нового на портале»*, и я пришлю свежие новости в виде журнала.
 • 📄 **Создание PDF-файлов** — напиши, например, *«Сделай мне пдф по электродинамике»*, и я сгенерирую готовый PDF по нужной теме.
 • 📸 **Работа с фото (до 10 штук)** — отправь от 1 до 10 картинок с вопросом, и я разберу их все сразу.
 • 🎙 **Голосовые сообщения** — отправь войс, и я запишу план в календарь, отвечу на вопрос, сделаю PDF или подготовлю письмо.
@@ -1090,6 +1109,7 @@ async def necessary_task_handler(event):
         mentioned = bool(
             event.mentioned or "@" in raw_l or "кристин" in raw_l
             or "christin" in raw_l or "портал" in raw_l or "portal" in raw_l
+            or "еверитайм" in raw_l or "эвритайм" in raw_l or "everytime" in raw_l
             or "топик" in raw_l or "групп" in raw_l
             or "сгенерируй видео" in raw_l or "сделай видео" in raw_l
         )
@@ -1103,6 +1123,7 @@ async def necessary_task_handler(event):
                 return
 
     if await handle_dgist_conversation_step(event, uid, state, user_states): return
+    if await handle_everytime_conversation_step(event, uid, state, user_states): return
 
     if state == "antigravity_mode" and is_owner(uid):
         if event.message.voice:

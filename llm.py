@@ -101,6 +101,59 @@ def _get_portal_context_for_user(user_id: int | None) -> str:
         pass
     return ""
 
+
+everytime_context_store: dict[int, str] = {}
+
+
+def format_everytime_posts_for_context(posts: list[dict]) -> str:
+    if not posts:
+        return ""
+    blocks = []
+    for idx, p in enumerate(posts[:18], 1):
+        kws = ", ".join(p.get("matched_keywords") or [])
+        comms = "\n".join(f"   - {c}" for c in (p.get("comments_ru") or [])[:10])
+        block = (
+            f"[Everytime Пост #{idx}] (ID: {p.get('id', '')})\n"
+            f"Ссылка: {p.get('url', '')}\n"
+            f"Дата: {p.get('created_at', '')} | Лайки: {p.get('likes', 0)} | Ключевые слова: {kws}\n"
+            f"Заголовок (RU): {p.get('title_ru', '')}\n"
+            f"Текст (RU дословно): {p.get('text_ru', '')}\n"
+            f"Оригинал (KO): {p.get('title_ko', '')} — {p.get('text_ko', '')}\n"
+        )
+        if comms:
+            block += f"Комментарии (RU):\n{comms}\n"
+        blocks.append(block)
+    return "\n---\n".join(blocks)
+
+
+def store_everytime_context(user_id: int | None, posts: list[dict]):
+    if not posts:
+        return
+    formatted = format_everytime_posts_for_context(posts)
+    uid = int(user_id) if user_id is not None else 0
+    everytime_context_store[uid] = formatted
+    everytime_context_store[0] = formatted
+
+
+def _get_everytime_context_for_user(user_id: int | None) -> str:
+    uid = int(user_id) if user_id is not None else 0
+    ctx = everytime_context_store.get(uid) or everytime_context_store.get(0)
+    if ctx:
+        return ctx
+    try:
+        from everytime_monitor import load_everytime_seen_data
+        seen = load_everytime_seen_data(uid)
+        last_posts = (seen or {}).get("last_magazine_posts") or []
+        if last_posts:
+            ctx = format_everytime_posts_for_context(last_posts)
+            everytime_context_store[uid] = ctx
+            everytime_context_store[0] = ctx
+            return ctx
+    except Exception:
+        pass
+    return ""
+
+
 class UserIntent(BaseModel):
     intent: str = Field(
         default="chat",
@@ -109,10 +162,11 @@ class UserIntent(BaseModel):
             "'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; "
             "'email' ONLY if user explicitly asks to write/send/compose an email to someone; "
             "'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; "
-            "'portal' ONLY if user explicitly asks to run a check/scan of the DGIST portal right now (e.g. 'чекни портал', 'проверь портал', 'что нового на портале'); "
-            "do NOT use 'portal' if user asks follow-up questions about a specific notice, asks for a registration/application link from a notice, or asks 'what does this mean' (use 'chat' for those!); "
+            "'portal' ONLY if user explicitly asks to run a check/scan of the official DGIST portal right now (e.g. 'чекни портал', 'проверь портал'); "
+            "'everytime' ONLY if user explicitly asks to check/parse/scan Everytime / 에브리타임 / еверитайм (e.g. 'чекни еверитайм', 'что пишут на everytime', 'парсни еверитайм'); "
+            "do NOT use 'portal' or 'everytime' if user asks follow-up questions about an already shown post, asks for a link, or asks 'what does this mean' (use 'chat' for those!); "
             "'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; "
-            "'chat' for everything else (including questions about previously shown photos or DGIST notices/links)"
+            "'chat' for everything else (including questions about previously shown photos, DGIST notices, or Everytime posts)"
         )
     )
     is_video: bool = Field(default=False, description="True if intent == 'video' or user asks to generate/make a video or animate an image")
@@ -120,6 +174,8 @@ class UserIntent(BaseModel):
     is_email: bool = Field(default=False, description="True if intent == 'email'")
     is_pdf: bool = Field(default=False, description="True if intent == 'pdf'")
     is_portal: bool = Field(default=False, description="True if intent == 'portal'")
+    is_everytime: bool = Field(default=False, description="True if intent == 'everytime'")
+    everytime_query: str = Field(default="", description="Optional specific search term if user asked to search Everytime for a specific topic, else empty for default keyword scan")
     is_group_query: bool = Field(default=False, description="True if intent == 'group_query' or user asks about group messages/topics")
     is_calendar: bool = Field(default=False, description="True if intent == 'calendar' or user asks about calendar/plans/reminders")
     calendar_action: str = Field(default="create", description="'create' to add/schedule event or reminder, 'list' to view upcoming calendar plans")
@@ -156,6 +212,7 @@ async def parse_user_intent(text: str) -> UserIntent:
         elif data.intent == "email": data.is_email = True
         elif data.intent == "pdf": data.is_pdf = True
         elif data.intent == "portal": data.is_portal = True
+        elif data.intent == "everytime": data.is_everytime = True
         elif data.intent == "group_query": data.is_group_query = True
         elif data.intent == "calendar": data.is_calendar = True
         return data
@@ -206,6 +263,7 @@ async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=chat_text)]))
 
     portal_ctx = await asyncio.to_thread(_get_portal_context_for_user, user_id)
+    et_ctx = await asyncio.to_thread(_get_everytime_context_for_user, user_id)
     sys_inst = (
         "Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
         "Ты помнишь все отправленные пользователем фотографии и предыдущие сообщения в диалоге."
@@ -216,6 +274,12 @@ async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
             "Если пользователь спрашивает про какую-то новость, просит скинуть ссылку на регистрацию/подачу заявки или спрашивает «а что это значит?», "
             "используй данные ниже, дай точную ссылку и подробно объясни суть:\n---\n"
             + portal_ctx
+        )
+    if et_ctx:
+        sys_inst += (
+            "\n\nВ твоей памяти также хранятся спарсенные посты и комментарии со студенческого форума DGIST Everytime (에브리타임) с их дословным переводом и оригиналом. "
+            "Если пользователь спрашивает про какой-то пост с Everytime, просит перевести комментарии или рассказать подробности:\n---\n"
+            + et_ctx
         )
 
     cfg = types.GenerateContentConfig(

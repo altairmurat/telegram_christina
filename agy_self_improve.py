@@ -197,6 +197,8 @@ def _build_codebase_prompt(files: dict[str, str]) -> str:
         "llm.py",
         "dgist_bot_handlers.py",
         "dgist_monitor.py",
+        "everytime_bot_handlers.py",
+        "everytime_monitor.py",
         "fal_video.py",
         "google_calendar.py",
         "group_memory.py",
