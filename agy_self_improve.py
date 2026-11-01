@@ -213,7 +213,11 @@ def _build_codebase_prompt(files: dict[str, str]) -> str:
 
 def _call_gemini_coder(system_instruction: str, prompt: str) -> SelfImprovementPlan:
     client = genai.Client(api_key=GEMINI_API_KEY)
-    models_to_try = ["gemini-2.5-pro", "gemini-2.5-flash"]
+    env_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    models_to_try = []
+    for m in ("gemini-3.8-flash", env_model, "gemini-3.5-flash-lite", "gemini-3.1-pro-preview"):
+        if m and m not in models_to_try:
+            models_to_try.append(m)
     last_err = None
     for model_name in models_to_try:
         try:
