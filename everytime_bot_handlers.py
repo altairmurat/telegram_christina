@@ -151,17 +151,20 @@ async def run_everytime_command(event, mode: str = "keywords", custom_query: str
         )
         return
 
-    if uid in _active_et_checks:
-        await event.reply("⏳ Уже паршу и перевожу посты с Everytime, подожди пару секунд...")
-        return
-
-    _active_et_checks.add(uid)
     mode_label = (
         f"по запросу «{custom_query}»"
         if mode == "custom" and custom_query
         else ("всю свежую ленту" if mode == "all" else "по ключевым словам (foreigner / 외국인 / 201 / 기숙사 / dormitory и др.)")
     )
     status_msg = await event.reply(f"🔄 Паршу DGIST Everytime ({mode_label}) и перевожу слово в слово через Gemini...")
+
+    # Если фоновый поток прямо сейчас уже обновляет ленту, дождёмся его завершения (до 25 сек)
+    wait_ticks = 0
+    while uid in _active_et_checks and wait_ticks < 25:
+        await asyncio.sleep(1)
+        wait_ticks += 1
+
+    _active_et_checks.add(uid)
     try:
         res = await asyncio.to_thread(etm.run_everytime_check, uid, mode, custom_query)
         posts = res.get("posts") or []
@@ -228,7 +231,7 @@ async def handle_everytime_conversation_step(event, uid: int, state, user_states
         await asyncio.to_thread(etm.save_everytime_cookie, uid, txt)
         user_states.pop(uid, None)
         await st.edit(
-            f"✅ **Everytime DGIST успешно подключён!** (Найдено {len(test_articles)} свежих постов на доске 393752, сессия зашифрована в БД).\n\n"
+            f"✅ **Everytime DGIST успешно подключён!** (Найдено {len(test_articles)} свежих постов на доске 393752, сессия сохранена в БД).\n\n"
             "📌 **Как пользоваться:**\n"
             "• Нажми /everytime (или напиши *«чекни еверитайм»*) — я найду все посты по ключевым словам (`foreigner`, `외국인`, `201`, `기숙사`, `dormitory` и др.) и выдам журнал с **переводом слово в слово**.\n"
             "• Нажми /etkeywords — чтобы посмотреть или добавить свои ключевые слова.\n"
@@ -255,7 +258,7 @@ def register_everytime_handlers(client, user_states: dict):
             "2️⃣ Нажми клавишу **F12** (откроется панель разработчика) → сверху выбери вкладку **Application** (или **Приложение** / **Хранилище**).\n"
             "3️⃣ Слева в меню открой **Cookies** → `https://everytime.kr`.\n"
             "4️⃣ Найди строчку с именем **`etsid`**, скопируй её **Value (Значение)** и отправь мне сюда в ответ!\n\n"
-            "🔒 _Я сразу удалю твоё сообщение из чата и сохраню зашифрованную сессию в БД (или нажми /cancel)._"
+            "🔒 _Я сразу удалю твоё сообщение из чата и сохраню сессию в БД (или нажми /cancel)._"
         )
 
     @client.on(events.NewMessage(pattern=r"(?i)^/(everytime|et)(@\w+)?(?:\s+([\s\S]*))?$"))
@@ -381,7 +384,8 @@ def register_everytime_handlers(client, user_states: dict):
 
 
 async def _auto_everytime_loop(client):
-    await asyncio.sleep(35)
+    # Ждём 15 минут после старта, чтобы не блокировать ручные команды /everytime сразу после деплоя
+    await asyncio.sleep(900)
     while True:
         try:
             uids = await asyncio.to_thread(etm.list_everytime_user_ids)
