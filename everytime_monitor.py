@@ -13,7 +13,7 @@ from google.genai import types
 
 from database import SessionLocal
 import models
-from crypto_utils import encrypt_str, decrypt_str
+from crypto_utils import encrypt as encrypt_str, decrypt as decrypt_str
 from env import GEMINI_API_KEY
 
 DGIST_FREE_BOARD_ID = "393752"
