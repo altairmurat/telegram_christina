@@ -1039,29 +1039,35 @@ async def necessary_task_handler(event):
     uid, sender = event.sender_id, await event.get_sender()
     state = user_states.get(uid)
 
-    if event.is_reply:
-        try:
+    try:
+        target_owner = None
+        if event.is_reply:
             rmsg = await event.get_reply_message()
             if rmsg:
                 target_owner = find_shak_sender(event.chat_id, rmsg.id)
-                if target_owner:
-                    s_name = getattr(sender, "first_name", "") or getattr(sender, "title", "") or "Пользователь"
-                    uname = f"@{sender.username}" if getattr(sender, "username", None) else f"ID: {uid}"
-                    await client.send_message(
-                        target_owner,
-                        f"📩 **Ответ от {s_name} ({uname}) на твоё сообщение:**"
-                    )
-                    try:
-                        await client.forward_messages(target_owner, event.message)
-                    except Exception:
-                        if event.text:
-                            await client.send_message(target_owner, event.text)
-                        elif event.message.media:
-                            await client.send_file(target_owner, event.message.media, caption=event.message.message or "")
-                    await event.reply("✅ Твой ответ передан!")
-                    return
-        except Exception as ex:
-            print(f"Error checking shak reply: {ex}")
+        if not target_owner and shak_cache:
+            # Если прямой Reply не найден, но пользователь явно отвечает на недавнее письмо в этом же чате
+            recent_owner = list(shak_cache.values())[-1] if shak_cache else None
+            if recent_owner and event.chat_id in [k[0] for k in shak_cache.keys()]:
+                target_owner = recent_owner
+        if target_owner:
+            s_name = getattr(sender, "first_name", "") or getattr(sender, "title", "") or "Пользователь"
+            uname = f"@{sender.username}" if getattr(sender, "username", None) else f"ID: {uid}"
+            await client.send_message(
+                target_owner,
+                f"📩 **Сообщение/ответ от {s_name} ({uname}):**"
+            )
+            try:
+                await client.forward_messages(target_owner, event.message)
+            except Exception:
+                if event.text:
+                    await client.send_message(target_owner, event.text)
+                elif event.message.media:
+                    await client.send_file(target_owner, event.message.media, caption=event.message.message or "")
+            await event.reply("✅ Твой ответ передан!")
+            return
+    except Exception as ex:
+        print(f"Error checking shak relay message: {ex}")
 
     if not event.is_private:
         raw_l = (event.raw_text or "").lower()
