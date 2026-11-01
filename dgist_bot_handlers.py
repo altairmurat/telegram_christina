@@ -1,16 +1,83 @@
-import asyncio, json, os, sys, subprocess, traceback
-from telethon import events
+import asyncio, json, math, os, secrets, sys, subprocess, traceback
+from telethon import events, Button
 import dgist_monitor
 from dgist_accounts import (
     save_dgist_account, load_dgist_account, delete_dgist_account, list_dgist_user_ids,
     load_dgist_session, save_dgist_session, load_dgist_seen_ids,
     save_dgist_group_target, load_dgist_group_target, get_dgist_last_check_age_sec
 )
+from llm import store_portal_context
 
 _active_portal_checks = set()
 AUTO_CHECK_INTERVAL_SEC = 33 * 60 * 60
 _auto_monitor_task = None
 GROUP_TARGET_FILE = os.path.join("user_data", "group_target.json")
+POSTS_PER_PAGE = 3
+portal_magazines: dict[str, dict] = {}
+
+
+def create_portal_magazine(uid: int, posts: list[dict], header: str) -> str:
+    mag_id = secrets.token_hex(4)
+    portal_magazines[mag_id] = {
+        "mag_id": mag_id,
+        "uid": uid,
+        "posts": posts,
+        "header": header,
+    }
+    if len(portal_magazines) > 100:
+        oldest = next(iter(portal_magazines))
+        portal_magazines.pop(oldest, None)
+    return mag_id
+
+
+def format_portal_magazine_page(mag: dict, page: int) -> tuple[str, list | None]:
+    posts = mag.get("posts") or []
+    header = mag.get("header") or "🔔 **Журнал объявлений DGIST:**"
+    mag_id = mag.get("mag_id", "default")
+    if not posts:
+        return "✅ Новых объявлений DGIST нет.", None
+
+    total_pages = max(1, math.ceil(len(posts) / POSTS_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * POSTS_PER_PAGE
+    slice_posts = posts[start_idx : start_idx + POSTS_PER_PAGE]
+
+    lines = [f"{header}\n📖 **Страница {page + 1} из {total_pages}** (всего: {len(posts)})\n"]
+    for offset, p in enumerate(slice_posts):
+        num = start_idx + offset + 1
+        em = "🔴" if p.get("important") else "📢"
+        cat = p.get("category", "DGIST")
+        title = p.get("title", "Без названия")
+        block = f"**#{num}** {em} [{cat}]\n**{title}**"
+        if p.get("date"):
+            block += f"\n📅 {p['date']}"
+        summary = (p.get("summary") or "").strip()
+        if summary:
+            if len(summary) > 900:
+                summary = summary[:900] + "..."
+            block += f"\n{summary}"
+        lines.append(block)
+
+    lines.append(
+        "\n💡 _Ты можешь спросить меня про любую новость (например: «что значит новость #2?» или «скинь ссылку на регистрацию из новости про ...»)_"
+    )
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "..."
+
+    if total_pages <= 1:
+        return text, None
+
+    prev_page = (page - 1) % total_pages
+    next_page = (page + 1) % total_pages
+    buttons = [
+        [
+            Button.inline("⬅️ Назад", data=f"dgmag:{mag_id}:{prev_page}".encode("utf-8")),
+            Button.inline(f"📄 {page + 1}/{total_pages}", data=b"dgmag:noop"),
+            Button.inline("Вперёд ➡️", data=f"dgmag:{mag_id}:{next_page}".encode("utf-8")),
+        ]
+    ]
+    return text, buttons
 
 def get_topic_id(event) -> int | None:
     r = getattr(event.message, "reply_to", None)
@@ -79,10 +146,27 @@ async def run_portal_check(e):
         if res.get("error"):
             await status_msg.edit(f"❌ Ошибка проверки:\n{res['error']}")
         else:
-            msgs = _format_new_posts_messages(res)
-            for idx, m in enumerate(msgs):
-                if idx == 0: await status_msg.edit(m)
-                else: await e.reply(m)
+            new_posts = list(res.get("new_important", [])) + list(res.get("new_minor", []))
+            recent_posts = list(res.get("recent_posts") or [])
+            if new_posts:
+                posts_to_show = new_posts
+                header = f"🔔 **Новые объявления DGIST ({len(new_posts)} шт.):**"
+            elif recent_posts:
+                posts_to_show = recent_posts
+                header = "✅ **Новых объявлений с прошлой проверки нет.**\n📰 **Журнал последних объявлений DGIST:**"
+            else:
+                posts_to_show = []
+                header = "✅ Новых объявлений DGIST нет."
+
+            if not posts_to_show:
+                await status_msg.edit(header)
+            else:
+                store_portal_context(e.sender_id, posts_to_show)
+                if uid != e.sender_id:
+                    store_portal_context(uid, posts_to_show)
+                mag_id = create_portal_magazine(uid, posts_to_show, header)
+                text, buttons = format_portal_magazine_page(portal_magazines[mag_id], 0)
+                await status_msg.edit(text, buttons=buttons, link_preview=False)
     except Exception as ex:
         await status_msg.edit(f"❌ Не удалось проверить портал: {ex}")
     finally:
@@ -110,6 +194,50 @@ def register_dgist_handlers(client, user_states: dict):
     @client.on(events.NewMessage(pattern=r'^/checkportal(@\w+)?(\s|$)'))
     async def check_portal(e):
         await run_portal_check(e)
+
+    @client.on(events.CallbackQuery(pattern=rb"^dgmag:"))
+    async def handle_magazine_pagination(event):
+        data = event.data.decode("utf-8", errors="ignore")
+        if data == "dgmag:noop":
+            await event.answer("Листай страницы кнопками ⬅️ Назад / Вперёд ➡️")
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
+        _, mag_id, page_str = parts
+        try:
+            page = int(page_str)
+        except ValueError:
+            return
+
+        mag = portal_magazines.get(mag_id)
+        if not mag:
+            uid = event.sender_id
+            db_seen = await asyncio.to_thread(load_dgist_seen_ids, uid)
+            if not db_seen:
+                all_uids = await asyncio.to_thread(list_dgist_user_ids)
+                if all_uids:
+                    uid = all_uids[0]
+                    db_seen = await asyncio.to_thread(load_dgist_seen_ids, uid)
+            recent = (db_seen or {}).get("__recent_posts__") if isinstance(db_seen, dict) else None
+            if not recent:
+                await event.answer("Журнал устарел. Напиши /checkportal для обновления!", alert=True)
+                return
+            mag = {
+                "mag_id": mag_id,
+                "uid": uid,
+                "posts": recent,
+                "header": "📰 **Журнал объявлений DGIST:**",
+            }
+            portal_magazines[mag_id] = mag
+
+        store_portal_context(event.sender_id, mag["posts"])
+        text, buttons = format_portal_magazine_page(mag, page)
+        try:
+            await event.edit(text, buttons=buttons, link_preview=False)
+        except Exception:
+            pass
+        await event.answer()
 
     if _auto_monitor_task is None or _auto_monitor_task.done():
         _auto_monitor_task = asyncio.create_task(_auto_monitor_loop(client))
@@ -190,13 +318,20 @@ async def _auto_monitor_loop(client):
                     if not is_first and not res.get("error"):
                         posts = list(res.get("new_important", [])) + list(res.get("new_minor", []))
                         if posts:
-                            formatted = _format_new_posts_messages(res)
-                            for m in formatted:
-                                await client.send_message(uid, m, link_preview=False)
+                            store_portal_context(uid, posts)
+                            header = f"🔔 **Новые объявления DGIST ({len(posts)} шт.):**"
+                            mag_id = create_portal_magazine(uid, posts, header)
+                            text, buttons = format_portal_magazine_page(portal_magazines[mag_id], 0)
+                            await client.send_message(uid, text, buttons=buttons, link_preview=False)
                             gt = await asyncio.to_thread(load_group_target)
                             if gt and gt.get("chat_id") and gt.get("chat_id") != uid:
-                                for m in formatted:
-                                    await client.send_message(gt["chat_id"], m, reply_to=gt.get("topic_id"), link_preview=False)
+                                await client.send_message(
+                                    gt["chat_id"],
+                                    text,
+                                    buttons=buttons,
+                                    reply_to=gt.get("topic_id"),
+                                    link_preview=False,
+                                )
                 except Exception as ex:
                     print(f"[AUTO] Ошибка user={uid}: {ex}")
                 finally:

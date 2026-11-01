@@ -12,11 +12,108 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # 10 пар сообщений (10 от пользователя + 10 ответов ассистента = 20 элементов)
 user_contexts = defaultdict(lambda: deque(maxlen=20))
+# Хранилище последних объявлений портала DGIST (полный текст + ссылки) для каждого пользователя
+portal_context_store: dict[int, str] = {}
+
+def format_portal_posts_for_context(posts: list[dict]) -> str:
+    if not posts:
+        return ""
+    blocks = []
+    for idx, p in enumerate(posts[:20], 1):
+        links_list = p.get("links") or []
+        links_str = "\n".join(
+            f"   - {lk.get('label', 'Ссылка')}: {lk.get('url', '')}"
+            for lk in links_list if isinstance(lk, dict) and lk.get("url")
+        )
+        post_url = p.get("post_url") or ""
+        full_txt = (p.get("full_text") or p.get("summary") or "")[:2500]
+        block = (
+            f"Объявление #{idx}: {p.get('title', 'Без названия')}\n"
+            f"Раздел: {p.get('category', 'DGIST')} | Дата: {p.get('date', '')}\n"
+            f"Краткая суть: {p.get('summary', '')}\n"
+        )
+        if post_url:
+            block += f"Прямая ссылка на пост на портале: {post_url}\n"
+        if links_str:
+            block += f"Извлечённые ссылки (регистрация / формы / сайты):\n{links_str}\n"
+        if full_txt:
+            block += f"Полный текст объявления:\n{full_txt}\n"
+        blocks.append(block)
+    return "\n---\n".join(blocks)
+
+def store_portal_context(user_id: int | None, posts: list[dict]) -> None:
+    """Сохраняет вытащенные объявления с портала (включая полный текст и ссылки на регистрацию) в контекст пользователя."""
+    if not posts:
+        return
+    ctx_text = format_portal_posts_for_context(posts)
+    if not ctx_text:
+        return
+    uid = int(user_id) if user_id is not None else 0
+    portal_context_store[uid] = ctx_text
+    portal_context_store[0] = ctx_text
+    if user_id is not None:
+        hist = user_contexts[user_id]
+        summary_lines = [
+            f"#{i}. [{p.get('category', 'DGIST')}] {p.get('title', '')} — {p.get('summary', '')}"
+            for i, p in enumerate(posts[:15], 1)
+        ]
+        hist.append(
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "[Выгружены объявления с портала DGIST в журнал и сохранены в память со всеми ссылками и полным текстом:]\n"
+                            + "\n".join(summary_lines)
+                        )
+                    )
+                ],
+            )
+        )
+
+def _get_portal_context_for_user(user_id: int | None) -> str:
+    uid = int(user_id) if user_id is not None else 0
+    ctx = portal_context_store.get(uid) or portal_context_store.get(0)
+    if ctx:
+        return ctx
+    try:
+        from dgist_accounts import load_dgist_seen_ids, list_dgist_user_ids
+        target_uid = uid if uid else None
+        if not target_uid:
+            uids = list_dgist_user_ids()
+            target_uid = uids[0] if uids else None
+        if target_uid:
+            seen = load_dgist_seen_ids(target_uid)
+            recent = seen.get("__recent_posts__", []) if isinstance(seen, dict) else []
+            if not recent:
+                uids = list_dgist_user_ids()
+                for u in uids:
+                    s2 = load_dgist_seen_ids(u)
+                    if isinstance(s2, dict) and s2.get("__recent_posts__"):
+                        recent = s2["__recent_posts__"]
+                        break
+            if recent:
+                ctx = format_portal_posts_for_context(recent)
+                portal_context_store[uid] = ctx
+                portal_context_store[0] = ctx
+                return ctx
+    except Exception:
+        pass
+    return ""
 
 class UserIntent(BaseModel):
     intent: str = Field(
         default="chat",
-        description="'video' ONLY if user explicitly asks to generate/create/make a video or animate a photo; 'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; 'email' ONLY if user explicitly asks to write/send/compose an email to someone; 'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; 'portal' ONLY if user asks to check the DGIST portal/announcements/notices; 'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; 'chat' for everything else"
+        description=(
+            "'video' ONLY if user explicitly asks to generate/create/make a video or animate a photo; "
+            "'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; "
+            "'email' ONLY if user explicitly asks to write/send/compose an email to someone; "
+            "'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; "
+            "'portal' ONLY if user explicitly asks to run a check/scan of the DGIST portal right now (e.g. 'чекни портал', 'проверь портал', 'что нового на портале'); "
+            "do NOT use 'portal' if user asks follow-up questions about a specific notice, asks for a registration/application link from a notice, or asks 'what does this mean' (use 'chat' for those!); "
+            "'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; "
+            "'chat' for everything else (including questions about previously shown photos or DGIST notices/links)"
+        )
     )
     is_video: bool = Field(default=False, description="True if intent == 'video' or user asks to generate/make a video or animate an image")
     video_prompt_en: str = Field(default="", description="Detailed visual prompt in English for generating the video (translate user's video idea into vivid English visual description)")
@@ -104,11 +201,25 @@ async def generate_email_text(topic: str, recipient: str, sendername: str) -> tu
         return topic[:50] or "Без темы", res.text or ""
 
 async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
-    """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений) на каждого пользователя."""
+    """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений), фото-памятью и контекстом портала DGIST."""
     hist = user_contexts[user_id]
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=chat_text)]))
+
+    portal_ctx = await asyncio.to_thread(_get_portal_context_for_user, user_id)
+    sys_inst = (
+        "Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
+        "Ты помнишь все отправленные пользователем фотографии и предыдущие сообщения в диалоге."
+    )
+    if portal_ctx:
+        sys_inst += (
+            "\n\nВ твоей памяти также хранятся последние объявления с портала DGIST (включая их полные тексты и ссылки на регистрацию / формы). "
+            "Если пользователь спрашивает про какую-то новость, просит скинуть ссылку на регистрацию/подачу заявки или спрашивает «а что это значит?», "
+            "используй данные ниже, дай точную ссылку и подробно объясни суть:\n---\n"
+            + portal_ctx
+        )
+
     cfg = types.GenerateContentConfig(
-        system_instruction="Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя.",
+        system_instruction=sys_inst,
         temperature=0.7
     )
     res = await client.aio.models.generate_content(model=MODEL, contents=list(hist), config=cfg)
@@ -128,7 +239,7 @@ async def transcribe_voice(voice_bytes: bytes) -> str:
     return (res.text or "").strip()
 
 async def process_telegram_images(messages, user_prompt: str, user_id: int | None = None) -> str:
-    """Обработка от 1 до 10 изображений одновременно через мультимодальный Gemini с сохранением в контекст."""
+    """Обработка от 1 до 10 изображений одновременно через мультимодальный Gemini с полным сохранением самих фото и текста в контекст."""
     msg_list = messages if isinstance(messages, list) else [messages]
     raw_images = await asyncio.gather(*(m.download_media(file=bytes) for m in msg_list[:10]))
     parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in raw_images if b]
@@ -138,17 +249,19 @@ async def process_telegram_images(messages, user_prompt: str, user_id: int | Non
     parts.append(types.Part.from_text(text=prompt_txt))
 
     hist = user_contexts[user_id]
+    user_turn = types.Content(role="user", parts=parts)
     cfg = types.GenerateContentConfig(
         system_instruction="Ты персональный ассистент Кристина. Проанализируй все переданные изображения и ответь на запрос пользователя.",
         temperature=0.7
     )
     res = await client.aio.models.generate_content(
         model=MODEL,
-        contents=[*list(hist), types.Content(role="user", parts=parts)],
+        contents=[*list(hist), user_turn],
         config=cfg
     )
     reply = (res.text or "Ответ пуст.").strip()
-    hist.append(types.Content(role="user", parts=[types.Part.from_text(text=f"[Фото: {len(parts)-1} шт.] {prompt_txt}")]))
+    # Сохраняем сами изображения + вопрос пользователя + ответ модели в контекст, чтобы помнить фото в следующих сообщениях!
+    hist.append(user_turn)
     hist.append(types.Content(role="model", parts=[types.Part.from_text(text=reply)]))
     return reply
 

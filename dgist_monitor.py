@@ -103,6 +103,33 @@ def fetch_list(session: requests.Session, menu_key: str, board_id: str, page: in
         })
     return posts[:POSTS_PER_CATEGORY]
 
+def _extract_links_and_enrich_html(container) -> list[dict]:
+    if not container:
+        return []
+    links = []
+    seen_urls = set()
+    for a in container.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or href.lower().startswith("javascript:"):
+            continue
+        if href.startswith("/"):
+            href = BASE_URL + href
+        if not href.startswith("http"):
+            continue
+        label = a.get_text(" ", strip=True) or "Ссылка"
+        if href not in seen_urls:
+            seen_urls.add(href)
+            links.append({"label": label[:120], "url": href})
+        if href not in label:
+            a.replace_with(f"{label} ({href})")
+    raw_txt = container.get_text("\n", strip=True)
+    for m in re.finditer(r"https?://[^\s<>\"')\]}]+", raw_txt):
+        u = m.group(0).rstrip(".,;:")
+        if u not in seen_urls:
+            seen_urls.add(u)
+            links.append({"label": "Ссылка из текста", "url": u})
+    return links
+
 def fetch_detail(session: requests.Session, menu_key: str, board_id: str, post_id: str) -> dict:
     url = f"{BASE_URL}/s/potal_board/{menu_key}/viewBbs.do"
     params = {"NOTIWR_NO": post_id, "currentPage": 1, "BOARD_ID": board_id, "SITE_KEY": SITE_KEY, "MENU_KEY": menu_key, "language": LANGUAGE}
@@ -112,22 +139,34 @@ def fetch_detail(session: requests.Session, menu_key: str, board_id: str, post_i
         raise SessionExpiredError(f"Сессия истекла при открытии поста {post_id}.")
     soup = BeautifulSoup(resp.text, "html.parser")
     eng, kor, body = soup.select_one("tr#cntn_eng_view"), soup.select_one("tr#cntn_kor_view"), soup.select_one("td.boardViewBody")
-    text = (eng.get_text("\n", strip=True) if eng and eng.get_text(strip=True) else
-            kor.get_text("\n", strip=True) if kor and kor.get_text(strip=True) else
-            body.get_text("\n", strip=True) if body else "")
+
+    target_node = (
+        eng if (eng and eng.get_text(strip=True))
+        else kor if (kor and kor.get_text(strip=True))
+        else body
+    )
+    links = _extract_links_and_enrich_html(target_node) if target_node else []
+    text = target_node.get_text("\n", strip=True) if target_node else ""
     if not text:
         candidates = [el.get_text(" ", strip=True) for el in soup.select("td, div")]
         text = max(candidates, key=len, default="")
+        for m in re.finditer(r"https?://[^\s<>\"')\]}]+", text):
+            u = m.group(0).rstrip(".,;:")
+            if all(x["url"] != u for x in links):
+                links.append({"label": "Ссылка", "url": u})
+
     attachments = []
     for a in soup.select("div.bbs_single_file a[onclick], div.bbs_file a[onclick]"):
         m = re.search(r"fnDownloadFile\(\s*['\"]?([^'\",)]+)['\"]?\s*,\s*['\"]?([^'\",)]+)['\"]?\s*\)", a.get("onclick", ""))
         if m: attachments.append({"conn_no": m.group(1), "seq_no": m.group(2), "label": a.get_text(strip=True)})
-    return {"text": text, "attachments": attachments}
+
+    post_url = f"{url}?NOTIWR_NO={post_id}&currentPage=1&BOARD_ID={board_id}&SITE_KEY={SITE_KEY}&MENU_KEY={menu_key}&language={LANGUAGE}"
+    return {"text": text, "links": links, "post_url": post_url, "attachments": attachments}
 
 def summarize_with_gemini(title: str, text: str, category: str) -> dict:
     preview = (" ".join((text or "").split()))[:300] or "Описание объявления недоступно."
     if not gemini_client: return {"important": True, "summary": preview}
-    prompt = f"Раздел: {category}\nЗаголовок: {title}\nТекст:\n{text[:4000]}\n\nСделай краткое описание на русском языке (максимум 2 предложения) и определи important=true (дедлайн, стипендия, важное изменение правил) или false."
+    prompt = f"Раздел: {category}\nЗаголовок: {title}\nТекст:\n{text[:4000]}\n\nСделай краткое описание на русском языке (максимум 2 предложения) и определи important=true (дедлайн, стипендия, регистрация, важное изменение правил) или false."
     try:
         cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=NoticeSummary, temperature=0.2)
         res = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=cfg)
@@ -155,12 +194,17 @@ def run_once(
         if seen and uid:
             save_dgist_seen_ids(uid, seen)
 
-    is_first = not bool(seen)
+    real_keys = [k for k in seen.keys() if not k.startswith("__")]
+    is_first = not bool(real_keys)
+    recent_stored: list[dict] = list(seen.get("__recent_posts__", []))
+    need_initial_seed = is_first or not recent_stored
+
     new_imp, new_min, processed_titles = [], [], set()
+    seeded_posts = []
 
     for menu_key, (board_id, cat_name) in CATEGORIES.items():
         try: posts = fetch_list(session, menu_key, board_id)
-        except SessionExpiredError as e: return {"new_important": [], "new_minor": [], "digest_top10": [], "error": str(e)}
+        except SessionExpiredError as e: return {"new_important": [], "new_minor": [], "digest_top10": [], "recent_posts": recent_stored, "error": str(e)}
         except Exception as e:
             print(f"[LIST ERROR] {menu_key}: {e}")
             continue
@@ -171,9 +215,41 @@ def run_once(
         if is_first:
             ex_ids.update(curr_ids)
             seen[menu_key] = list(ex_ids)
+            # При первой инициализации загружаем последние 4 поста из главного раздела, чтобы журнал и контекст сразу работали
+            if need_initial_seed and len(seeded_posts) < 6:
+                for p in posts[:3]:
+                    if len(seeded_posts) >= 6:
+                        break
+                    t_key = p["title"].strip().lower()
+                    if t_key in processed_titles:
+                        continue
+                    try:
+                        detail = fetch_detail(session, menu_key, board_id, p["post_id"])
+                        verdict = summarize_with_gemini(p["title"], detail["text"], cat_name)
+                        processed_titles.add(t_key)
+                        seeded_posts.append({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "category": cat_name,
+                            "post_id": p["post_id"],
+                            "title": p["title"],
+                            "date": p["date"],
+                            "author": p["author"],
+                            "important": verdict["important"],
+                            "summary": verdict["summary"],
+                            "full_text": detail["text"][:4500],
+                            "links": detail["links"],
+                            "post_url": detail["post_url"],
+                            "attachments": detail["attachments"],
+                        })
+                    except Exception:
+                        pass
             continue
 
         fresh = [p for p in posts if p["post_id"] not in ex_ids]
+        # Если в БД ещё не было сохранённых постов для журнала, подгрузим несколько свежих
+        if not fresh and need_initial_seed and len(seeded_posts) < 5:
+            fresh = posts[:2]
+
         for p in fresh:
             pid = p["post_id"]
             t_key = p["title"].strip().lower()
@@ -185,7 +261,7 @@ def run_once(
                 seen[menu_key] = list(ex_ids)
                 if uid: save_dgist_seen_ids(uid, seen)
                 save_seen(seen, state_file)
-                return {"new_important": new_imp, "new_minor": new_min, "digest_top10": [], "error": str(e)}
+                return {"new_important": new_imp, "new_minor": new_min, "digest_top10": [], "recent_posts": recent_stored, "error": str(e)}
             except Exception as e:
                 print(f"[DETAIL ERROR] post={pid}: {e}")
                 ex_ids.add(pid); continue
@@ -193,13 +269,35 @@ def run_once(
 
             verdict = summarize_with_gemini(p["title"], detail["text"], cat_name)
             processed_titles.add(t_key)
-            entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "category": cat_name, "post_id": pid,
-                     "title": p["title"], "date": p["date"], "author": p["author"],
-                     "important": verdict["important"], "summary": verdict["summary"], "attachments": detail["attachments"]}
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "category": cat_name,
+                "post_id": pid,
+                "title": p["title"],
+                "date": p["date"],
+                "author": p["author"],
+                "important": verdict["important"],
+                "summary": verdict["summary"],
+                "full_text": detail["text"][:4500],
+                "links": detail["links"],
+                "post_url": detail["post_url"],
+                "attachments": detail["attachments"],
+            }
             append_log(entry, log_file)
-            (new_imp if entry["important"] else new_min).append(entry)
+            if pid not in seen.get(menu_key, []):
+                (new_imp if entry["important"] else new_min).append(entry)
+            else:
+                seeded_posts.append(entry)
             ex_ids.add(pid)
         seen[menu_key] = list(ex_ids)
+
+    newly_found = new_imp + new_min + seeded_posts
+    if newly_found:
+        existing_by_id = {x.get("post_id"): x for x in recent_stored if isinstance(x, dict)}
+        for item in newly_found:
+            existing_by_id.pop(item.get("post_id"), None)
+        recent_stored = (newly_found + list(existing_by_id.values()))[:25]
+        seen["__recent_posts__"] = recent_stored
 
     if uid:
         save_dgist_seen_ids(uid, seen)
@@ -211,7 +309,13 @@ def run_once(
             new_cookie_str = "; ".join(f"{k}={v}" for k, v in merged.items())
             save_dgist_session(uid, session_cookie=new_cookie_str)
     save_seen(seen, state_file)
-    return {"new_important": new_imp, "new_minor": new_min, "digest_top10": [], "error": None}
+    return {
+        "new_important": new_imp,
+        "new_minor": new_min,
+        "digest_top10": seeded_posts,
+        "recent_posts": recent_stored,
+        "error": None,
+    }
 
 def run_once_for_user(uid: int, dgist_cookie=None) -> dict:
     from dgist_accounts import load_dgist_session, save_dgist_session
