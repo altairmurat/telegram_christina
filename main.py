@@ -39,6 +39,7 @@ from fal_video import (
     check_hard_safety_filter, VIDEO_MODELS, DEFAULT_MODEL_KEY, DEFAULT_DURATION_SEC,
     get_admin_prefs, set_admin_prefs, extract_hints_from_text
 )
+from agy_self_improve import execute_self_improvement_sync, rollback_github_branch
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 app = FastAPI()
@@ -535,10 +536,39 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
-    data = event.data.decode()
+    data = event.data.decode("utf-8", errors="ignore")
     if ":" not in data: return
     parts = data.split(":")
     action, arg1 = parts[0], parts[1] if len(parts) > 1 else ""
+
+    # Кнопки пагинации журнала DGIST обрабатываются в dgist_bot_handlers
+    if action == "dgmag":
+        return
+
+    # Кнопки Antigravity (выход из режима и откат коммита)
+    if action == "agyexit":
+        if not is_owner(event.sender_id):
+            return await event.answer("⛔ Доступно только владельцу бота.", alert=True)
+        user_states.pop(event.sender_id, None)
+        await event.answer("Режим Antigravity выключен")
+        return await event.edit("🔌 **Режим Antigravity выключен.** Я снова в обычном режиме!", buttons=None)
+
+    if action == "agyrb":
+        if not is_owner(event.sender_id):
+            return await event.answer("⛔ Доступно только владельцу бота.", alert=True)
+        target_sha = arg1
+        await event.edit(f"⏪ **Откатываю изменения в GitHub к коммиту `{target_sha[:7]}`...**", buttons=None)
+        try:
+            rb_res = await asyncio.to_thread(rollback_github_branch, target_sha)
+            new_sha = rb_res["new_commit_sha"]
+            await event.edit(
+                f"✅ **Откат успешно выполнен и запушен в GitHub!**\n"
+                f"🔗 Возвращено состояние коммита `{target_sha[:7]}` (новый коммит: `{new_sha[:7]}`).\n"
+                f"⏳ Render автоматически перезапустит бота через ~1–2 минуты."
+            )
+        except Exception as ex:
+            await event.edit(f"❌ Ошибка при откате коммита: {ex}")
+        return
 
     # Обработка кнопок админ-панели генерации видео
     if action in ("vmod", "vdur", "vrun", "vcancel"):
@@ -620,6 +650,8 @@ async def on_callback(event):
                 mark_generation_finished(job["user_id"])
             return
 
+    if action not in ("send", "cancel", "edit"):
+        return
     draft_id = arg1
     msg_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else (event.message_id or 0)
     uid = draft_cache.get(draft_id) or event.sender_id
@@ -662,6 +694,7 @@ async def startup_event():
                 types.BotCommand("checkportal", "Проверить объявления DGIST"),
                 types.BotCommand("connectmyportal", "Подключить портал DGIST"),
                 types.BotCommand("disconnectportal", "Отключить портал DGIST"),
+                types.BotCommand("antigravity", "Режим самоулучшения Antigravity (Owner)"),
                 types.BotCommand("cancel", "Отменить действие"),
             ]
         ))
@@ -863,6 +896,62 @@ async def list_admin_shak_cmd(e):
     all_admins = await asyncio.to_thread(list_video_admins)
     await e.reply("📋 **Список безлимитных видео-админов:**\n" + "\n".join(all_admins))
 
+
+async def run_antigravity_task(event, instruction: str):
+    status_msg = await event.reply(
+        "🧠 **Antigravity Agent запущен...**\n"
+        "📥 Читаю актуальный код из GitHub, проектирую изменения, проверяю синтаксис и пушу..."
+    )
+    try:
+        res = await asyncio.to_thread(execute_self_improvement_sync, instruction)
+        short_sha = res["new_commit_sha"][:7]
+        prev_sha = res["previous_commit_sha"]
+        files_str = ", ".join(f"`{f}`" for f in res["modified_files"])
+        text = (
+            f"🚀 **Самоулучшение выполнено и запушено в GitHub!**\n\n"
+            f"📝 **Что сделано:**\n{res['summary_ru']}\n\n"
+            f"📂 **Файлы:** {files_str}\n"
+            f"🔗 **Коммит:** [{short_sha}]({res['commit_url']}) — `{res['commit_message']}`\n\n"
+            f"⏳ _Render уже начал автоматический редеплой (~1–2 минуты)._"
+        )
+        btns = [
+            [
+                Button.inline("⏪ Откатить этот коммит", data=f"agyrb:{prev_sha}".encode("utf-8")),
+                Button.inline("🔌 Выйти из Antigravity", data=b"agyexit:1"),
+            ]
+        ]
+        await status_msg.edit(text, buttons=btns, link_preview=False)
+    except Exception as ex:
+        await status_msg.edit(
+            f"❌ **Antigravity остановил авто-пуш:**\n{ex}",
+            buttons=[[Button.inline("🔌 Выйти из Antigravity", data=b"agyexit:1")]],
+        )
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^/(antigravity|agy|agyShak)(@\w+)?(?:\s+([\s\S]*))?$'))
+async def antigravity_cmd(e):
+    if not is_owner(e.sender_id):
+        await e.reply("⛔ Режим Antigravity доступен только создателю бота.")
+        return
+    instruction = (e.pattern_match.group(3) or "").strip()
+    if instruction:
+        user_states[e.sender_id] = "antigravity_mode"
+        await run_antigravity_task(e, instruction)
+        return
+
+    if user_states.get(e.sender_id) == "antigravity_mode":
+        user_states.pop(e.sender_id, None)
+        await e.reply("🔌 **Режим Antigravity выключен.** Я снова в обычном режиме!")
+    else:
+        user_states[e.sender_id] = "antigravity_mode"
+        await e.reply(
+            "🧠 **Режим Antigravity включён!**\n\n"
+            "Теперь любое твоё сообщение (текстом или голосовым) воспринимается как команда на самоулучшение моего кода.\n"
+            "Например: *«Кристина, хочу чтобы ты теперь делала то-то...»*\n\n"
+            "Я сама изменю код, проверю синтаксис и **сразу запушу в GitHub**.",
+            buttons=[[Button.inline("🔌 Выйти из Antigravity", data=b"agyexit:1")]],
+        )
+
 @client.on(events.MessageEdited)
 async def on_message_edited(event):
     if not event.is_private:
@@ -901,6 +990,22 @@ async def necessary_task_handler(event):
                 return
 
     if await handle_dgist_conversation_step(event, uid, state, user_states): return
+
+    if state == "antigravity_mode" and is_owner(uid):
+        if event.message.voice:
+            vb = await event.message.download_media(file=bytes)
+            if not vb:
+                return await event.reply("Не удалось скачать аудио.")
+            txt = await transcribe_voice(vb)
+            if not txt:
+                return await event.reply("Не удалось распознать речь.")
+            await run_antigravity_task(event, txt)
+            return
+        if event.text:
+            clean_instruction = event.text.strip()
+            if clean_instruction:
+                await run_antigravity_task(event, clean_instruction)
+            return
 
     if state == "waiting_for_add_admin_shak" and event.text:
         user_states.pop(uid, None)

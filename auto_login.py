@@ -151,9 +151,37 @@ def login_and_get_cookie(
         ctx = browser.new_context(**ctx_kwargs)
         try:
             page = ctx.new_page()
-            page.goto(PORTAL_LOGIN_URL, wait_until="networkidle", timeout=60000)
+            # Блокируем тяжёлые картинки/шрифты/медиа, чтобы портал грузился быстро и не зависал на Render
+            page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font")
+                else route.continue_(),
+            )
+            loaded = False
+            for attempt in range(2):
+                try:
+                    page.goto(PORTAL_LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+                    loaded = True
+                    break
+                except Exception as goto_err:
+                    print(f"[LOGIN] Попытка {attempt+1} загрузки портала: {goto_err}")
+                    try:
+                        if page.locator(f"{USER_MARKER}, {USERNAME_SEL}").count() > 0:
+                            loaded = True
+                            break
+                    except Exception:
+                        pass
+            if not loaded:
+                page.goto(PORTAL_LOGIN_URL, wait_until="commit", timeout=45000)
+
             try:
-                page.wait_for_selector(USER_MARKER, timeout=5000)
+                page.wait_for_selector(f"{USER_MARKER}, {USERNAME_SEL}", timeout=20000)
+            except Exception:
+                pass
+
+            try:
+                page.wait_for_selector(USER_MARKER, timeout=3000)
                 alive = True
             except Exception:
                 alive = False
