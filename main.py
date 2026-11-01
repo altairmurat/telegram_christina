@@ -30,7 +30,7 @@ from everytime_bot_handlers import (
 )
 from group_memory import (
     record_group_message, search_group_messages, list_known_topics,
-    format_messages_for_prompt, get_default_chat_id
+    format_messages_for_prompt, get_default_chat_id, get_accessible_chat_ids_for_event
 )
 from google_calendar import (
     create_calendar_event, list_calendar_events, schedule_telegram_reminder,
@@ -437,31 +437,34 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         return True
 
     if intent.is_group_query:
-        cid = event.chat_id if not event.is_private else get_default_chat_id()
+        allowed_cids = await get_accessible_chat_ids_for_event(client, event)
+        if not allowed_cids:
+            await event.reply(
+                "⛔ У тебя нет доступа к топикам и сообщениям закрытых групп, в которых ты не состоишь."
+            )
+            return True
+
         msgs = search_group_messages(
             query=intent.group_search_query or text,
             topic_name=intent.group_topic_name,
-            chat_id=cid,
+            chat_id=allowed_cids,
             limit=30
         )
         if not msgs and intent.group_topic_name:
-            # Если по конкретному названию не нашлось, берем последние сообщения группы
-            msgs = search_group_messages(chat_id=cid, limit=25)
+            # Если по конкретному названию не нашлось, берем последние сообщения только из доступных пользователю групп
+            msgs = search_group_messages(chat_id=allowed_cids, limit=25)
 
         if not msgs:
-            known = list_known_topics(cid)
+            known = list_known_topics(allowed_cids)
             if not known:
                 await event.reply(
-                    "🔍 Я пока не сохранила сообщений из группы.\n\n"
-                    "Чтобы я могла читать топики:\n"
-                    "1. Добавь меня **Администратором** в группу (с правом читать сообщения) ИЛИ в @BotFather отключи `/setprivacy`.\n"
-                    "2. После этого я автоматически буду сохранять и знать все сообщения каждого топика!"
+                    "🔍 Я пока не сохранила сообщений из доступных тебе групп."
                 )
             else:
                 top_names = ", ".join([f"«{t['topic_title']}»" for t in known])
                 await event.reply(
                     f"🔍 Я не нашла сообщений по этому вопросу.\n"
-                    f"Отслеживаемые топики в группе: {top_names}."
+                    f"Доступные тебе топики в группе: {top_names}."
                 )
             return True
 
@@ -475,8 +478,8 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         try:
             pdf_prompt = text
             if "групп" in text.lower() or "топик" in text.lower() or intent.group_topic_name:
-                cid = event.chat_id if not event.is_private else get_default_chat_id()
-                msgs = search_group_messages(topic_name=intent.group_topic_name, chat_id=cid, limit=20)
+                allowed_cids = await get_accessible_chat_ids_for_event(client, event)
+                msgs = search_group_messages(topic_name=intent.group_topic_name, chat_id=allowed_cids, limit=20) if allowed_cids else []
                 if msgs:
                     pdf_prompt += f"\n\nДанные из сообщений группы:\n{format_messages_for_prompt(msgs)}"
             pdf_bytes = await generate_pdf_from_prompt(pdf_prompt, user_id=user_id)
@@ -605,8 +608,8 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     try:
         topic_text = intent.topic
         if "групп" in text.lower() or "топик" in text.lower() or intent.group_topic_name:
-            cid = event.chat_id if not event.is_private else get_default_chat_id()
-            msgs = search_group_messages(topic_name=intent.group_topic_name, chat_id=cid, limit=15)
+            allowed_cids = await get_accessible_chat_ids_for_event(client, event)
+            msgs = search_group_messages(topic_name=intent.group_topic_name, chat_id=allowed_cids, limit=15) if allowed_cids else []
             if msgs:
                 topic_text += f"\n\nДанные из группы:\n{format_messages_for_prompt(msgs)}"
         em = intent.recipient_email or await asyncio.to_thread(find_email_in_history, gmail, intent.recipient_name)
@@ -874,12 +877,15 @@ async def help_msg(e):
 
 @client.on(events.NewMessage(pattern=r'^/topics(@\w+)?(\s|$)'))
 async def show_topics(e):
-    cid = e.chat_id if not e.is_private else get_default_chat_id()
-    topics = list_known_topics(cid)
-    if not topics:
-        await e.reply("📭 Я пока ещё не зафиксировала топиков или сообщений в группе.\n\nУбедись, что я добавлена в группу администратором (с правом чтения сообщений).")
+    allowed_cids = await get_accessible_chat_ids_for_event(client, e)
+    if not allowed_cids:
+        await e.reply("⛔ У тебя нет доступа к топикам закрытых групп, в которых ты не состоишь.")
         return
-    lines = ["📋 **Топики в группе, которые я отслеживаю:**\n"]
+    topics = list_known_topics(allowed_cids)
+    if not topics:
+        await e.reply("📭 Я пока ещё не зафиксировала топиков или сообщений в доступных тебе группах.")
+        return
+    lines = ["📋 **Топики в группе, к которым у тебя есть доступ:**\n"]
     for idx, t in enumerate(topics, 1):
         lines.append(f"{idx}. 📌 **{t['topic_title']}** (сообщений: {t['message_count']})")
     lines.append("\n💡 Спроси меня: *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.")
