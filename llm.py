@@ -228,7 +228,7 @@ async def answer_with_group_context(user_query: str, group_context_text: str, us
 
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
     cfg = types.GenerateContentConfig(
-        system_instruction="Ты персональный ассистент Олег. Ты помогаешь ориентироваться в сообщениях и топиках группы Telegram. Отвечай кратко, понятно и дружелюбно.",
+        system_instruction="Ты персональный ассистент Кристина. Ты помогаешь ориентироваться в сообщениях и топиках группы Telegram. Отвечай кратко, понятно и дружелюбно.",
         temperature=0.4
     )
     res = await client.aio.models.generate_content(model=MODEL, contents=list(hist), config=cfg)
@@ -257,7 +257,7 @@ async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
     portal_ctx = await asyncio.to_thread(_get_portal_context_for_user, user_id)
     et_ctx = await asyncio.to_thread(_get_everytime_context_for_user, user_id)
     sys_inst = (
-        "Ты персональный ассистент Олег. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
+        "Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
         "Ты помнишь все отправленные пользователем фотографии и предыдущие сообщения в диалоге."
     )
     if portal_ctx:
@@ -307,7 +307,7 @@ async def process_telegram_images(messages, user_prompt: str, user_id: int | Non
     hist = user_contexts[user_id]
     user_turn = types.Content(role="user", parts=parts)
     cfg = types.GenerateContentConfig(
-        system_instruction="Ты персональный ассистент Олег. Проанализируй все переданные изображения и ответь на запрос пользователя.",
+        system_instruction="Ты персональный ассистент Кристина. Проанализируй все переданные изображения и ответь на запрос пользователя.",
         temperature=0.7
     )
     res = await client.aio.models.generate_content(
