@@ -1,4 +1,4 @@
-import os, io, asyncio, base64, hashlib, secrets, json, re, urllib.parse
+import os, io, asyncio, base64, hashlib, secrets, json, re, urllib.parse, datetime
 from collections import defaultdict
 from email.message import EmailMessage
 from fastapi import FastAPI, Request as FastAPIRequest
@@ -47,6 +47,66 @@ client = TelegramClient('session_bot_korean', API_ID, API_HASH)
 
 user_states, draft_cache, text_cache, pkce_store, video_job_cache = {}, {}, {}, {}, {}
 pending_photos, pending_captions, photo_tasks = defaultdict(list), {}, {}
+
+shak_cache: dict[tuple[int, int], int] = {}
+shak_msg_cache: dict[int, int] = {}
+
+def record_shak_message(sender_id: int, recipient_chat_id: int, message_id: int):
+    shak_cache[(recipient_chat_id, message_id)] = sender_id
+    shak_msg_cache[message_id] = sender_id
+    try:
+        with SessionLocal() as db:
+            db.add(models.ShakRelay(
+                sender_id=sender_id,
+                recipient_chat_id=recipient_chat_id,
+                message_id=message_id,
+                created_at=datetime.datetime.utcnow()
+            ))
+            db.commit()
+    except Exception as ex:
+        print(f"Error saving ShakRelay: {ex}")
+
+def find_shak_sender(recipient_chat_id: int, message_id: int) -> int | None:
+    if (recipient_chat_id, message_id) in shak_cache:
+        return shak_cache[(recipient_chat_id, message_id)]
+    if message_id in shak_msg_cache:
+        return shak_msg_cache[message_id]
+    try:
+        with SessionLocal() as db:
+            row = db.query(models.ShakRelay).filter_by(
+                recipient_chat_id=recipient_chat_id,
+                message_id=message_id
+            ).first()
+            if row:
+                shak_cache[(recipient_chat_id, message_id)] = row.sender_id
+                shak_msg_cache[message_id] = row.sender_id
+                return row.sender_id
+            row_by_msg = db.query(models.ShakRelay).filter_by(
+                message_id=message_id
+            ).first()
+            if row_by_msg:
+                shak_cache[(recipient_chat_id, message_id)] = row_by_msg.sender_id
+                shak_msg_cache[message_id] = row_by_msg.sender_id
+                return row_by_msg.sender_id
+    except Exception as ex:
+        print(f"Error finding ShakRelay: {ex}")
+    return None
+
+async def send_shak_message(event, sender_id: int, target_raw: str, text: str):
+    target = target_raw.strip()
+    if target.startswith("@"):
+        target = target[1:]
+    if target.isdigit() or (target.startswith("-") and target[1:].isdigit()):
+        target = int(target)
+    try:
+        sent_msg = await client.send_message(target, text)
+        record_shak_message(sender_id, sent_msg.chat_id, sent_msg.id)
+        await event.reply(
+            "✅ Сообщение отправлено!\n"
+            "Когда пользователь ответит на него (Reply), его ответ сразу перешлётся тебе."
+        )
+    except Exception as ex:
+        await event.reply(f"❌ Ошибка отправки: {ex}")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
@@ -836,8 +896,15 @@ async def connect_gmail(e):
     delete_user_token(e.sender_id)
     await e.reply(f"⚠️ **Подключение Google (Календарь и Gmail)**\n\nАвторизуйся по ссылке:\n{build_auth_url(e.sender_id)}")
 
-@client.on(events.NewMessage(pattern=r'(?i)^/sendShak(@\w+)?(\s|$)'))
+@client.on(events.NewMessage(pattern=r'(?i)^/sendShak(@\w+)?(?:\s+([\s\S]*))?$'))
 async def send_shak(e):
+    arg = (e.pattern_match.group(2) or "").strip()
+    if arg:
+        raw = arg.lstrip("!").strip()
+        parts = raw.split("/", 1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            await send_shak_message(e, e.sender_id, parts[0].strip(), parts[1].strip())
+            return
     user_states[e.sender_id] = "waiting_for_submitmessage"
     await e.reply('Напиши сообщение в формате: `!username/текст`')
 
@@ -972,6 +1039,30 @@ async def necessary_task_handler(event):
     uid, sender = event.sender_id, await event.get_sender()
     state = user_states.get(uid)
 
+    if event.is_reply:
+        try:
+            rmsg = await event.get_reply_message()
+            if rmsg:
+                target_owner = find_shak_sender(event.chat_id, rmsg.id)
+                if target_owner:
+                    s_name = getattr(sender, "first_name", "") or getattr(sender, "title", "") or "Пользователь"
+                    uname = f"@{sender.username}" if getattr(sender, "username", None) else f"ID: {uid}"
+                    await client.send_message(
+                        target_owner,
+                        f"📩 **Ответ от {s_name} ({uname}) на твоё сообщение:**"
+                    )
+                    try:
+                        await client.forward_messages(target_owner, event.message)
+                    except Exception:
+                        if event.text:
+                            await client.send_message(target_owner, event.text)
+                        elif event.message.media:
+                            await client.send_file(target_owner, event.message.media, caption=event.message.message or "")
+                    await event.reply("✅ Твой ответ передан!")
+                    return
+        except Exception as ex:
+            print(f"Error checking shak reply: {ex}")
+
     if not event.is_private:
         raw_l = (event.raw_text or "").lower()
         mentioned = bool(
@@ -1052,15 +1143,14 @@ async def necessary_task_handler(event):
         await event.reply("✅ Текст черновика обновлён!")
         return
 
-    if event.text and event.text.startswith("!") and state == "waiting_for_submitmessage":
-        parts = event.text[1:].split("/", 1)
+    if (event.text and event.text.startswith("!") and state == "waiting_for_submitmessage") or (state == "waiting_for_submitmessage" and event.text):
+        raw = event.text.lstrip("!").strip()
+        parts = raw.split("/", 1)
         if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-            try:
-                await client.send_message(parts[0].strip(), parts[1].strip())
-                await event.reply("✅ Сообщение отправлено!")
-            except Exception as ex: await event.reply(f"❌ Ошибка отправки: {ex}")
-            finally: user_states.pop(uid, None)
-        else: await event.reply("Формат: `!username/текст сообщения`")
+            user_states.pop(uid, None)
+            await send_shak_message(event, uid, parts[0].strip(), parts[1].strip())
+        else:
+            await event.reply("Формат: `!username/текст сообщения` (или /cancel)")
         return
 
     if event.message.voice:

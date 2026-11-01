@@ -107,3 +107,12 @@ class DgistSessionState(Base):
     seen_ids_json = Column(Text, nullable=True)        # JSON со списком уже просмотренных объявлений
     group_target_json = Column(Text, nullable=True)    # JSON активного топика группы для авто-уведомлений
     updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class ShakRelay(Base):
+    __tablename__ = "shak_relays"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sender_id = Column(BigInteger, index=True)
+    recipient_chat_id = Column(BigInteger, index=True)
+    message_id = Column(BigInteger, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
