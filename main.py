@@ -92,6 +92,21 @@ def find_shak_sender(recipient_chat_id: int, message_id: int) -> int | None:
         print(f"Error finding ShakRelay: {ex}")
     return None
 
+def clear_shak_tracking_for_chat(chat_id: int):
+    keys_to_del = [k for k in list(shak_cache.keys()) if k[0] == chat_id]
+    for k in keys_to_del:
+        shak_cache.pop(k, None)
+        shak_msg_cache.pop(k[1], None)
+    try:
+        with SessionLocal() as db:
+            rows = db.query(models.ShakRelay).filter_by(recipient_chat_id=chat_id).all()
+            for r in rows:
+                shak_msg_cache.pop(r.message_id, None)
+                db.delete(r)
+            db.commit()
+    except Exception as ex:
+        print(f"Error clearing ShakRelay for chat {chat_id}: {ex}")
+
 async def send_shak_message(event, sender_id: int, target_raw: str, text: str):
     target = target_raw.strip()
     if target.startswith("@"):
@@ -1064,8 +1079,9 @@ async def necessary_task_handler(event):
                     await client.send_message(target_owner, event.text)
                 elif event.message.media:
                     await client.send_file(target_owner, event.message.media, caption=event.message.message or "")
-            await event.reply("✅ Твой ответ передан!")
-            return
+            clear_shak_tracking_for_chat(event.chat_id)
+            # Не показываем пользователю, что ответ передан, и не прерываем обработку (не делаем return),
+            # чтобы бот ответил на запрос пользователя через Gemini штатным образом.
     except Exception as ex:
         print(f"Error checking shak relay message: {ex}")
 
