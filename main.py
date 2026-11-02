@@ -15,7 +15,7 @@ from env import API_ID, API_HASH, BOT_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SEC
 from database import SessionLocal, engine
 import models
 from llm import (
-    ask_gemini, transcribe_voice, process_telegram_images,
+    ask_gemini, transcribe_voice, process_telegram_images, process_pdf_document,
     parse_user_intent, generate_email_text, generate_pdf_from_prompt,
     answer_with_group_context, prepare_video_prompt_en, detect_photo_video_intent,
     moderate_and_prepare_video_prompt
@@ -51,6 +51,7 @@ client = TelegramClient('session_bot_korean', API_ID, API_HASH)
 
 user_states, draft_cache, text_cache, pkce_store, video_job_cache = {}, {}, {}, {}, {}
 pending_photos, pending_captions, photo_tasks = defaultdict(list), {}, {}
+pending_pdfs: dict[int, dict] = {}
 
 shak_cache: dict[tuple[int, int], int] = {}
 shak_msg_cache: dict[int, int] = {}
@@ -860,6 +861,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 • 📅 **Google Календарь и напоминания** — напиши, например: *«Запиши в календарь: сегодня в 19:00 созвон, это оч важно, напомни»* или *«Что у меня по планам?»* — я добавлю событие в календарь, настрою push-уведомления и пришлю напоминание прямо в Telegram!
 • 📂 **Поиск по топикам группы** — напиши *«Что писали в топике Important Announcements?»* или *«Найди в группе информацию про дедлайн»*.
 • 🎓 **Объявления DGIST** — напиши *«чекни портал»* или *«что нового на портале»*, и я пришлю свежие новости в виде журнала.
+• 📑 **Анализ PDF-файлов** — пришли мне любой PDF-документ (статью, лекцию, отчёт, задание), я спрошу, что с ним сделать (перевести, выделить главное, решить задачи) и запомню его в контексте диалога!
 • 📄 **Создание PDF-файлов** — напиши, например, *«Сделай мне пдф по электродинамике»*, и я сгенерирую готовый PDF по нужной теме.
 • 📸 **Работа с фото (до 10 штук)** — отправь от 1 до 10 картинок с вопросом, и я разберу их все сразу.
 • 🎙 **Голосовые сообщения** — отправь войс, и я запишу план в календарь, отвечу на вопрос, сделаю PDF или подготовлю письмо.
@@ -1200,6 +1202,93 @@ async def necessary_task_handler(event):
             await send_shak_message(event, uid, parts[0].strip(), parts[1].strip())
         else:
             await event.reply("Формат: `!username/текст сообщения` (или /cancel)")
+        return
+
+    if state == "waiting_for_pdf_prompt":
+        if event.text and event.text.strip().lower() in ("/cancel", "cancel", "отмена"):
+            pending_pdfs.pop(uid, None)
+            user_states.pop(uid, None)
+            await event.reply("❌ Обработка PDF отменена.")
+            return
+
+        prompt_txt = ""
+        if event.message.voice:
+            vb = await event.message.download_media(file=bytes)
+            if vb:
+                prompt_txt = await transcribe_voice(vb)
+        elif event.text:
+            prompt_txt = re.sub(r"@\w+", "", event.text).strip() or event.text
+
+        if not prompt_txt:
+            await event.reply("Пожалуйста, напиши текстом или скажи голосом, что сделать с PDF-файлом (или напиши /cancel):")
+            return
+
+        pdf_data = pending_pdfs.pop(uid, None)
+        user_states.pop(uid, None)
+        if not pdf_data or not pdf_data.get("bytes"):
+            await event.reply("⚠️ Файл не найден или сессия устарела. Отправь PDF-документ заново.")
+            return
+
+        fname = pdf_data.get("filename", "document.pdf")
+        st = await event.reply(f"⏳ Читаю и анализирую PDF «{fname}»...")
+        try:
+            ans = await process_pdf_document(
+                pdf_data["bytes"],
+                prompt_txt,
+                filename=fname,
+                user_id=uid
+            )
+            await st.edit(ans)
+        except Exception as ex:
+            await st.edit(f"❌ Ошибка обработки PDF: {ex}")
+        return
+
+    is_pdf_doc = False
+    pdf_filename = "document.pdf"
+    if event.message and event.message.file:
+        m_type = getattr(event.message.file, "mime_type", "") or ""
+        f_name = getattr(event.message.file, "name", "") or ""
+        if m_type == "application/pdf" or (f_name and f_name.lower().endswith(".pdf")):
+            is_pdf_doc = True
+            if f_name:
+                pdf_filename = f_name
+
+    if is_pdf_doc:
+        caption = (event.raw_text or "").strip()
+        if caption:
+            caption = re.sub(r"@\w+", "", caption).strip() or caption
+
+        st = await event.reply(f"📥 Загружаю PDF «{pdf_filename}»...")
+        try:
+            pdf_bytes = await event.message.download_media(file=bytes)
+            if not pdf_bytes:
+                await st.edit("❌ Не удалось скачать PDF-файл.")
+                return
+            if len(pdf_bytes) > 20 * 1024 * 1024:
+                await st.edit("❌ Файл слишком большой (> 20 МБ). Пришли файл меньшего размера.")
+                return
+
+            if caption:
+                await st.edit(f"⏳ Читаю и анализирую PDF «{pdf_filename}»...")
+                ans = await process_pdf_document(
+                    pdf_bytes,
+                    caption,
+                    filename=pdf_filename,
+                    user_id=uid
+                )
+                await st.edit(ans)
+            else:
+                pending_pdfs[uid] = {
+                    "bytes": pdf_bytes,
+                    "filename": pdf_filename,
+                }
+                user_states[uid] = "waiting_for_pdf_prompt"
+                await st.edit(
+                    f"📄 Получила PDF-документ **{pdf_filename}**!\n\n"
+                    f"Что с ним сделать? Напиши вопрос или задачу (например: *«сделай краткую выжимку»*, *«переведи на русский»*, *«ответь на вопросы...»*) — или просто отправь голосовое сообщение:"
+                )
+        except Exception as ex:
+            await st.edit(f"❌ Ошибка загрузки PDF: {ex}")
         return
 
     if event.message.voice:

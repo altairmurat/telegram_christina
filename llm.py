@@ -249,8 +249,45 @@ async def generate_email_text(topic: str, recipient: str, sendername: str) -> tu
     except Exception:
         return topic[:50] or "Без темы", res.text or ""
 
+async def process_pdf_document(
+    pdf_bytes: bytes,
+    user_prompt: str,
+    filename: str = "document.pdf",
+    user_id: int | None = None
+) -> str:
+    """Обрабатывает PDF-документ через Gemini с сохранением документа и диалога в контекст пользователя."""
+    if not pdf_bytes:
+        return "Не удалось загрузить PDF-файл (файл пуст)."
+    if len(pdf_bytes) > 20 * 1024 * 1024:
+        return "Файл слишком большой (> 20 МБ). Пожалуйста, отправь файл меньшего размера."
+
+    pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+    prompt_txt = user_prompt or "Изучи этот PDF-документ и сделай краткое резюме его содержания."
+    text_part = types.Part.from_text(text=f"[Прикреплённый PDF-документ: {filename}]\nЗапрос пользователя: {prompt_txt}")
+
+    hist = user_contexts[user_id]
+    user_turn = types.Content(role="user", parts=[pdf_part, text_part])
+    cfg = types.GenerateContentConfig(
+        system_instruction=(
+            "Ты персональный ассистент Кристина. Внимательно изучи прикреплённый PDF-документ и ответь на запрос пользователя "
+            "подробно, структурированно, точно и понятно на русском языке (или на языке запроса пользователя). "
+            "Ты помнишь содержание этого документа и сможешь отвечать на последующие уточняющие вопросы пользователя по нему."
+        ),
+        temperature=0.4
+    )
+    res = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=[*list(hist), user_turn],
+        config=cfg
+    )
+    reply = (res.text or "Ответ пуст.").strip()
+    # Сохраняем сам PDF, запрос пользователя и ответ модели в контекст пользователя
+    hist.append(user_turn)
+    hist.append(types.Content(role="model", parts=[types.Part.from_text(text=reply)]))
+    return reply
+
 async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
-    """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений), фото-памятью и контекстом портала DGIST."""
+    """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений), фото-памятью, контекстом PDF и портала DGIST."""
     hist = user_contexts[user_id]
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=chat_text)]))
 
@@ -258,7 +295,7 @@ async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
     et_ctx = await asyncio.to_thread(_get_everytime_context_for_user, user_id)
     sys_inst = (
         "Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
-        "Ты помнишь все отправленные пользователем фотографии и предыдущие сообщения в диалоге."
+        "Ты помнишь все отправленные пользователем фотографии, прикреплённые PDF-документы и предыдущие сообщения в диалоге."
     )
     if portal_ctx:
         sys_inst += (
