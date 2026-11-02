@@ -1,4 +1,4 @@
-import os, re, asyncio, requests
+import os, re, asyncio, datetime, requests
 from collections import defaultdict, deque
 from google import genai
 from google.genai import types
@@ -172,10 +172,17 @@ class UserIntent(BaseModel):
     is_calendar: bool = Field(default=False, description="True if intent == 'calendar' or user asks about calendar/plans/reminders")
     calendar_action: str = Field(default="create", description="'create' to add/schedule event or reminder, 'list' to view upcoming calendar plans")
     calendar_summary: str = Field(default="", description="Clean, concise title of the plan/task, e.g. 'Сделать домашку по физике'")
-    calendar_start_iso: str = Field(default="", description="Start time in ISO 8601 (YYYY-MM-DDTHH:MM:SS), calculated using current_time and user prompt")
-    calendar_end_iso: str = Field(default="", description="End time in ISO 8601 (YYYY-MM-DDTHH:MM:SS), default 1 hour after start if not specified")
+    calendar_start_iso: str = Field(default="", description="Start time in ISO 8601 (YYYY-MM-DDTHH:MM:SS) in Asia/Seoul (UTC+9) timezone, calculated strictly from Current time and user prompt")
+    calendar_end_iso: str = Field(default="", description="End time in ISO 8601 (YYYY-MM-DDTHH:MM:SS) in Asia/Seoul (UTC+9), default 1 hour after start if not specified")
     is_important: bool = Field(default=False, description="True if user mentioned 'оч важно', 'срочно', 'супер важно', 'важно', 'high priority'")
-    reminder_minutes: list[int] = Field(default_factory=lambda: [15], description="Minutes before event to remind user, e.g. [15] or [10, 30, 60] if important")
+    reminder_minutes: list[int] = Field(
+        default_factory=lambda: [15],
+        description=(
+            "Minutes before event to remind user. Use [0] if user asks for a direct reminder at a specific time or offset "
+            "(e.g. 'напомни через 30 минут', 'напомни в 23:00 что надо домой'). "
+            "Use [15] for normal meetings/events or [10, 30, 60] if important."
+        ),
+    )
     calendar_description: str = Field(default="", description="Optional additional details for the calendar event")
     group_topic_name: str = Field(default="", description="Name or title of the group topic if mentioned (e.g. 'important announcements', 'homework', 'general')")
     group_search_query: str = Field(default="", description="Key terms or topic to search within group messages")
@@ -191,11 +198,17 @@ class EmailDraft(BaseModel):
     subject: str = Field(description="Email subject line")
     body: str = Field(description="Email body text")
 
+KST = datetime.timezone(datetime.timedelta(hours=9))
+
 async def parse_user_intent(text: str) -> UserIntent:
     """Определяет намерение пользователя (video / calendar / email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
-    from datetime import datetime
-    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00 (%A)")
-    prompt = f"Current time: {now_str} (Asia/Seoul timezone, UTC+9). Parse this user request:\n\"{text}\""
+    now_kst = datetime.datetime.now(KST)
+    now_str = now_kst.strftime("%Y-%m-%dT%H:%M:%S+09:00 (%A)")
+    prompt = (
+        f"Current local time in South Korea (Asia/Seoul, UTC+9): {now_str}.\n"
+        f"IMPORTANT: All dates and times (calendar_start_iso, calendar_end_iso) MUST be computed in Asia/Seoul (UTC+9) relative to {now_str}.\n"
+        f"Parse this user request:\n\"{text}\""
+    )
     cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=UserIntent, temperature=0.1)
     res = await client.aio.models.generate_content(model=MODEL, contents=prompt, config=cfg)
     try:
@@ -288,15 +301,14 @@ async def process_pdf_document(
 
 async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
     """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений), фото-памятью, контекстом PDF и портала DGIST."""
-    from datetime import datetime
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S+09:00 (%A)")
+    now_kst_str = datetime.datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S+09:00 (%A), Asia/Seoul (UTC+9)")
     hist = user_contexts[user_id]
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=chat_text)]))
 
     portal_ctx = await asyncio.to_thread(_get_portal_context_for_user, user_id)
     et_ctx = await asyncio.to_thread(_get_everytime_context_for_user, user_id)
     sys_inst = (
-        f"Current time and date: {now_str} (Asia/Seoul timezone, UTC+9).\n"
+        f"Current time and date: {now_kst_str}.\n"
         "Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
         "Ты помнишь текущие дату и время, все отправленные пользователем фотографии, прикреплённые PDF-документы и предыдущие сообщения в диалоге, "
         "поэтому ты можешь понимать, когда пользователь обращается к тебе спустя некоторое время."

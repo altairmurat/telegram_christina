@@ -541,9 +541,23 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         # calendar_action == "create"
         summary = intent.calendar_summary or "Новая задача"
         start_iso = intent.calendar_start_iso
+        kst_tz = datetime.timezone(datetime.timedelta(hours=9))
         if not start_iso:
-            from datetime import datetime, timedelta
-            start_iso = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00")
+            start_iso = (datetime.datetime.now(kst_tz) + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00")
+
+        # Определяем, просит ли пользователь прямое напоминание к конкретному моменту ("напомни через 30 минут", "напомни в 23:30")
+        low_txt = text.lower()
+        is_direct_reminder = (
+            (intent.reminder_minutes is not None and 0 in intent.reminder_minutes)
+            or ("через " in low_txt and "за " not in low_txt)
+            or ("напомни" in low_txt and "за " not in low_txt and not intent.is_important)
+        )
+        if is_direct_reminder:
+            mins_before = 0
+            cal_rem_list = [0]
+        else:
+            mins_before = 30 if intent.is_important else 15
+            cal_rem_list = intent.reminder_minutes or [mins_before]
 
         status_msg = await event.reply("📅 Записываю событие в Google Календарь...")
         try:
@@ -555,12 +569,11 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
                 intent.calendar_end_iso,
                 intent.calendar_description,
                 intent.is_important,
-                intent.reminder_minutes
+                cal_rem_list
             )
             event_link = created_event.get("htmlLink", "")
 
             # Планируем прямое напоминание в Telegram
-            mins_before = 30 if intent.is_important else 15
             schedule_telegram_reminder(
                 telegram_user_id=user_id,
                 title=summary,
@@ -571,15 +584,23 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
             )
 
             priority_str = "🔥 **Очень важно (Высокий приоритет)**" if intent.is_important else "Обычный"
-            remind_str = "за 10, 30 и 60 мин (email + push)" if intent.is_important else f"за {mins_before} мин (push)"
-            time_display = start_iso.replace("T", " в ")[:18]
+            clean_iso = start_iso.split("+")[0].split("Z")[0]
+            time_display = clean_iso.replace("T", " в ")[:18]
+            hh_mm = clean_iso.split("T")[1][:5] if "T" in clean_iso else time_display
+
+            if mins_before == 0:
+                remind_line = f"ровно в **{hh_mm}** (push + сообщение в Telegram)"
+            elif intent.is_important:
+                remind_line = f"за 10, 30 и 60 мин (email + push) + в Telegram за {mins_before} мин"
+            else:
+                remind_line = f"за {mins_before} мин (push) + в Telegram за {mins_before} мин"
 
             resp_text = (
                 f"✅ **Событие добавлено в Google Календарь!**\n\n"
                 f"📌 **Задача:** {summary}\n"
                 f"🕒 **Время:** {time_display}\n"
                 f"⚡ **Приоритет:** {priority_str}\n"
-                f"🔔 **Напоминания:** {remind_str} + в Telegram за {mins_before} мин"
+                f"🔔 **Напоминания:** {remind_line}"
             )
             btns = []
             if event_link:

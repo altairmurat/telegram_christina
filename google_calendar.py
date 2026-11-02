@@ -94,8 +94,8 @@ def create_calendar_event(
             {"method": "email", "minutes": 60}
         ]
     else:
-        mins = reminder_minutes if reminder_minutes else [15]
-        body["reminders"]["overrides"] = [{"method": "popup", "minutes": m} for m in mins]
+        mins = reminder_minutes if reminder_minutes is not None else [15]
+        body["reminders"]["overrides"] = [{"method": "popup", "minutes": max(0, int(m))} for m in mins]
 
     event = service.events().insert(calendarId="primary", body=body).execute()
     return event
@@ -154,10 +154,13 @@ def schedule_telegram_reminder(
         return
 
     remind_at = utc_start - timedelta(minutes=minutes_before)
-    # Если событие прямо сейчас или в ближайшие минуты — напоминаем через 10 секунд
     now_utc = datetime.utcnow()
-    if remind_at < now_utc:
-        remind_at = now_utc + timedelta(seconds=10)
+    # Если время предварительного уведомления уже прошло, но само событие в будущем — напоминаем ровно в момент события!
+    if remind_at <= now_utc:
+        if utc_start > now_utc:
+            remind_at = utc_start
+        else:
+            remind_at = now_utc + timedelta(seconds=10)
 
     try:
         # Форматируем красивую дату для текста напоминания (по времени пользователя UTC+9)
