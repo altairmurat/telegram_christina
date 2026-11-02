@@ -18,7 +18,7 @@ from llm import (
     ask_gemini, transcribe_voice, process_telegram_images,
     parse_user_intent, generate_email_text, generate_pdf_from_prompt,
     answer_with_group_context, prepare_video_prompt_en, detect_photo_video_intent,
-    moderate_and_prepare_video_prompt
+    moderate_and_prepare_video_prompt, get_media_recommendation
 )
 from dgist_bot_handlers import (
     register_dgist_handlers, handle_dgist_conversation_step,
@@ -421,6 +421,16 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     if await handle_everytime_url_in_message(event, text):
         return True
     intent = await parse_user_intent(text)
+    if intent.is_media:
+        status_media = await event.reply("🍿 Подбираю фильм/сериал и ссылки для просмотра...")
+        try:
+            m_query = (intent.media_query or text).strip()
+            ans = await get_media_recommendation(m_query, user_id=user_id)
+            await status_media.edit(ans, link_preview=False)
+        except Exception as ex:
+            await status_media.edit(f"❌ Ошибка поиска: {ex}")
+        return True
+
     if intent.is_video:
         sender = await event.get_sender()
         uname = getattr(sender, "username", None) if sender else None
@@ -855,6 +865,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 ✨ **Возможности (просто напиши или скажи голосом):**
 • 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
+• 🍿 **Фильмы и сериалы** — напиши *«скинь фильм Интерстеллар»*, *«скинь сериал Во все тяжкие»* или *«посоветуй хороший детектив»*, и я выдам карточку с рейтингом, сюжетом и прямыми ссылками на просмотр!
 • 🇰🇷 **Парсер DGIST Everytime** — напиши *«чекни еверитайм»*, используй /everytime или скинь прямую ссылку `everytime.kr/393752/v/...`, и я выдам журнал постов по ключевым словам (`foreigner`, `외국인`, `201`, `기숙사`, `dormitory` и др.) с дословным переводом слово в слово и комментариями!
 • 🎬 **Генерация видео** — напиши *«Сгенерируй видео на тему...»* или отправь фото с подписью *«Сгенерируй видео на...»*, и я создам короткий видеоролик (доступно 1 видео в день).
 • 📅 **Google Календарь и напоминания** — напиши, например: *«Запиши в календарь: сегодня в 19:00 созвон, это оч важно, напомни»* или *«Что у меня по планам?»* — я добавлю событие в календарь, настрою push-уведомления и пришлю напоминание прямо в Telegram!
