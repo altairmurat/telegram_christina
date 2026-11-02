@@ -288,14 +288,18 @@ async def process_pdf_document(
 
 async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
     """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений), фото-памятью, контекстом PDF и портала DGIST."""
+    from datetime import datetime
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S+09:00 (%A)")
     hist = user_contexts[user_id]
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=chat_text)]))
 
     portal_ctx = await asyncio.to_thread(_get_portal_context_for_user, user_id)
     et_ctx = await asyncio.to_thread(_get_everytime_context_for_user, user_id)
     sys_inst = (
+        f"Current time and date: {now_str} (Asia/Seoul timezone, UTC+9).\n"
         "Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
-        "Ты помнишь все отправленные пользователем фотографии, прикреплённые PDF-документы и предыдущие сообщения в диалоге."
+        "Ты помнишь текущие дату и время, все отправленные пользователем фотографии, прикреплённые PDF-документы и предыдущие сообщения в диалоге, "
+        "поэтому ты можешь понимать, когда пользователь обращается к тебе спустя некоторое время."
     )
     if portal_ctx:
         sys_inst += (
