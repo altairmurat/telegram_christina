@@ -126,3 +126,11 @@ class EverytimeState(Base):
     keywords_json = Column(Text, nullable=True)        # JSON-список ключевых слов пользователя
     seen_ids_json = Column(Text, nullable=True)        # JSON с просмотренными ID постов и кэшем последних переводов
     updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class UserSetting(Base):
+    __tablename__ = "user_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id = Column(BigInteger, unique=True, index=True)
+    timezone = Column(String, default="Asia/Seoul", nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)

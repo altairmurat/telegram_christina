@@ -1,11 +1,11 @@
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 from database import SessionLocal
 import models
-
-DEFAULT_TIMEZONE = "Asia/Seoul"
+from timezone_helper import get_user_timezone, DEFAULT_TIMEZONE
 DEFAULT_TZ_OFFSET = "+09:00"
 
 def _ensure_rfc3339(dt_str: str, tz_offset: str = DEFAULT_TZ_OFFSET) -> str:
@@ -146,7 +146,8 @@ def schedule_telegram_reminder(
     start_iso: str,
     is_important: bool,
     event_id: str = None,
-    minutes_before: int = 15
+    minutes_before: int = 15,
+    tz_name: str = None
 ):
     """Планирует отправку прямого напоминания в Telegram за N минут до события."""
     utc_start = _parse_to_utc(_ensure_rfc3339(start_iso))
@@ -163,8 +164,13 @@ def schedule_telegram_reminder(
             remind_at = now_utc + timedelta(seconds=10)
 
     try:
-        # Форматируем красивую дату для текста напоминания (по времени пользователя UTC+9)
-        local_time = utc_start + timedelta(hours=9)
+        # Форматируем красивую дату для текста напоминания (по местному часовому поясу пользователя)
+        tz_str = tz_name or get_user_timezone(telegram_user_id)
+        try:
+            user_tz = ZoneInfo(tz_str)
+        except Exception:
+            user_tz = ZoneInfo("Asia/Seoul")
+        local_time = utc_start.replace(tzinfo=timezone.utc).astimezone(user_tz)
         time_str = local_time.strftime("%d.%m в %H:%M")
 
         with SessionLocal() as db:

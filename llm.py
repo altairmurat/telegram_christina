@@ -198,15 +198,15 @@ class EmailDraft(BaseModel):
     subject: str = Field(description="Email subject line")
     body: str = Field(description="Email body text")
 
-KST = datetime.timezone(datetime.timedelta(hours=9))
+from timezone_helper import get_user_now
 
-async def parse_user_intent(text: str) -> UserIntent:
+async def parse_user_intent(text: str, user_id: int | None = None) -> UserIntent:
     """Определяет намерение пользователя (video / calendar / email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
-    now_kst = datetime.datetime.now(KST)
-    now_str = now_kst.strftime("%Y-%m-%dT%H:%M:%S+09:00 (%A)")
+    now_dt, tz_name, tz_offset = get_user_now(user_id)
+    now_str = now_dt.strftime(f"%Y-%m-%dT%H:%M:%S{tz_offset} (%A)")
     prompt = (
-        f"Current local time in South Korea (Asia/Seoul, UTC+9): {now_str}.\n"
-        f"IMPORTANT: All dates and times (calendar_start_iso, calendar_end_iso) MUST be computed in Asia/Seoul (UTC+9) relative to {now_str}.\n"
+        f"Current local time for this user: {now_str} (Timezone: {tz_name}, offset {tz_offset}).\n"
+        f"IMPORTANT: All dates and times (calendar_start_iso, calendar_end_iso) MUST be computed in this user's local timezone ({tz_name}, offset {tz_offset}) relative to {now_str}.\n"
         f"Parse this user request:\n\"{text}\""
     )
     cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=UserIntent, temperature=0.1)
@@ -301,16 +301,17 @@ async def process_pdf_document(
 
 async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
     """Асинхронный диалог с моделью с изолированной историей (10 пар сообщений), фото-памятью, контекстом PDF и портала DGIST."""
-    now_kst_str = datetime.datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S+09:00 (%A), Asia/Seoul (UTC+9)")
+    now_dt, tz_name, tz_offset = get_user_now(user_id)
+    now_str = now_dt.strftime(f"%Y-%m-%d %H:%M:%S{tz_offset} (%A), {tz_name}")
     hist = user_contexts[user_id]
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=chat_text)]))
 
     portal_ctx = await asyncio.to_thread(_get_portal_context_for_user, user_id)
     et_ctx = await asyncio.to_thread(_get_everytime_context_for_user, user_id)
     sys_inst = (
-        f"Current time and date: {now_kst_str}.\n"
+        f"Current time and date for this user: {now_str}.\n"
         "Ты персональный ассистент Кристина. Отвечай кратко, понятно и дружелюбно на языке пользователя. "
-        "Ты помнишь текущие дату и время, все отправленные пользователем фотографии, прикреплённые PDF-документы и предыдущие сообщения в диалоге, "
+        "Ты помнишь текущие дату и время пользователя, все отправленные им фотографии, прикреплённые PDF-документы и предыдущие сообщения в диалоге, "
         "поэтому ты можешь понимать, когда пользователь обращается к тебе спустя некоторое время."
     )
     if portal_ctx:

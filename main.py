@@ -36,6 +36,10 @@ from google_calendar import (
     create_calendar_event, list_calendar_events, schedule_telegram_reminder,
     run_reminder_worker
 )
+from timezone_helper import (
+    get_user_timezone, set_user_timezone, get_user_now,
+    sync_google_calendar_timezone, resolve_timezone_name
+)
 from fal_video import (
     is_owner, is_video_admin, add_video_admins, remove_video_admins,
     list_video_admins, check_video_quota, record_video_generation,
@@ -196,7 +200,9 @@ async def gmail_callback(request: FastAPIRequest):
         flow.code_verifier = pkce_store.pop(user_id, None)
         flow.fetch_token(code=request.query_params.get("code"))
         save_user_token(user_id, flow.credentials)
-        try: await client.send_message(user_id, "✅ Google аккаунт (Календарь и Gmail) успешно подключён! Можешь просить меня записывать планы в календарь, напоминать о делах и писать письма.")
+        detected_tz = await asyncio.to_thread(sync_google_calendar_timezone, user_id, flow.credentials)
+        tz_note = f"\n🌍 Часовой пояс календаря: **{detected_tz}** (настрой в любой момент через /tz)" if detected_tz else ""
+        try: await client.send_message(user_id, f"✅ Google аккаунт (Календарь и Gmail) успешно подключён!{tz_note}\nМожешь просить меня записывать планы в календарь, напоминать о делах и писать письма.")
         except Exception: pass
         return HTMLResponse("<h2>Готово! Закрой эту вкладку и вернись в Telegram.</h2>")
     except Exception as e:
@@ -421,7 +427,7 @@ async def handle_video_generation(
 async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     if await handle_everytime_url_in_message(event, text):
         return True
-    intent = await parse_user_intent(text)
+    intent = await parse_user_intent(text, user_id=user_id)
     if intent.is_video:
         sender = await event.get_sender()
         uname = getattr(sender, "username", None) if sender else None
@@ -541,9 +547,9 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         # calendar_action == "create"
         summary = intent.calendar_summary or "Новая задача"
         start_iso = intent.calendar_start_iso
-        kst_tz = datetime.timezone(datetime.timedelta(hours=9))
+        now_dt, tz_name, offset_str = get_user_now(user_id)
         if not start_iso:
-            start_iso = (datetime.datetime.now(kst_tz) + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00")
+            start_iso = (now_dt + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00")
 
         # Определяем, просит ли пользователь прямое напоминание к конкретному моменту ("напомни через 30 минут", "напомни в 23:30")
         low_txt = text.lower()
@@ -569,7 +575,8 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
                 intent.calendar_end_iso,
                 intent.calendar_description,
                 intent.is_important,
-                cal_rem_list
+                cal_rem_list,
+                tz_name
             )
             event_link = created_event.get("htmlLink", "")
 
@@ -580,7 +587,8 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
                 start_iso=start_iso,
                 is_important=intent.is_important,
                 event_id=created_event.get("id"),
-                minutes_before=mins_before
+                minutes_before=mins_before,
+                tz_name=tz_name
             )
 
             priority_str = "🔥 **Очень важно (Высокий приоритет)**" if intent.is_important else "Обычный"
@@ -654,6 +662,18 @@ async def on_callback(event):
 
     # Кнопки пагинации журналов DGIST и Everytime обрабатываются в своих модулях
     if action in ("dgmag", "etmag"):
+        return
+
+    # Выбор часового пояса
+    if action == "settz":
+        target_tz = arg1
+        set_user_timezone(event.sender_id, target_tz)
+        panel_txt, panel_btns = format_timezone_panel(event.sender_id)
+        try:
+            await event.edit(f"✅ **Часовой пояс успешно сохранён!**\n\n{panel_txt}", buttons=panel_btns)
+        except Exception:
+            pass
+        await event.answer("Часовой пояс обновлен!")
         return
 
     # Кнопки Antigravity (выход из режима и откат коммита)
@@ -807,6 +827,7 @@ async def startup_event():
                 types.BotCommand("connectmyportal", "Подключить портал DGIST"),
                 types.BotCommand("disconnectportal", "Отключить портал DGIST"),
                 types.BotCommand("calendar", "Ближайшие планы в Google Календаре"),
+                types.BotCommand("timezone", "Настроить часовой пояс (Корея, Казахстан, РФ и др.)"),
                 types.BotCommand("connectgoogle", "Подключить Google (Календарь и Gmail)"),
                 types.BotCommand("topics", "Список отслеживаемых топиков"),
                 types.BotCommand("antigravity", "Режим самоулучшения Antigravity (Owner)"),
@@ -871,6 +892,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 • /connectmyportal — подключить портал DGIST (в ЛС)
 • /disconnectportal — отключить портал DGIST
 • /calendar — ближайшие планы в календаре
+• /timezone (/tz) — настроить часовой пояс (Корея, Казахстан, Россия, Узбекистан и др.)
 • /connectgoogle — подключить Google (Календарь и Gmail)
 • /topics — список топиков в группе
 • /cancel — отменить текущее действие
@@ -953,6 +975,66 @@ async def show_calendar_cmd(e):
             await status_list.edit(f"⚠️ Нужно обновить доступ к Google Календарю: {build_auth_url(e.sender_id)}")
         else:
             await status_list.edit(f"❌ Ошибка получения событий: {ex}")
+
+def format_timezone_panel(user_id: int) -> tuple[str, list]:
+    now_dt, tz_name, offset_str = get_user_now(user_id)
+    cur_time = now_dt.strftime("%H:%M (%d.%m.%Y)")
+    text = (
+        f"🌍 **Настройка часового пояса**\n\n"
+        f"📍 Твой текущий пояс: **{tz_name}** (`{offset_str}`)\n"
+        f"🕒 Твоё местное время: **{cur_time}**\n\n"
+        "Выбери нужный регион кнопкой ниже или напиши свой город/смещение (например `/tz Almaty`, `/tz Moscow`, `/tz +5`):"
+    )
+    buttons = [
+        [
+            Button.inline("🇰🇷 Корея (Сеул/Тэгу, UTC+9)", b"settz:Asia/Seoul"),
+        ],
+        [
+            Button.inline("🇰🇿 Казахстан (Алматы/Астана, UTC+5)", b"settz:Asia/Almaty"),
+        ],
+        [
+            Button.inline("🇺🇿 Узбекистан (Ташкент, UTC+5)", b"settz:Asia/Tashkent"),
+        ],
+        [
+            Button.inline("🇷🇺 Россия (Москва/СПб, UTC+3)", b"settz:Europe/Moscow"),
+        ],
+        [
+            Button.inline("🇰🇬 Кыргызстан (Бишкек, UTC+6)", b"settz:Asia/Bishkek"),
+            Button.inline("🇬🇧 Лондон (UTC+0)", b"settz:Europe/London"),
+        ],
+    ]
+    return text, buttons
+
+@client.on(events.NewMessage(pattern=r'(?i)^/(timezone|tz)(@\w+)?(?:\s+([\s\S]*))?$'))
+async def timezone_cmd(e):
+    uid = e.sender_id
+    arg = (e.pattern_match.group(3) or "").strip()
+    if arg:
+        resolved = resolve_timezone_name(arg)
+        if not resolved:
+            await e.reply(
+                f"❌ Не удалось распознать часовой пояс «{arg}».\n\n"
+                "Примеры:\n"
+                "• `/tz Almaty` или `/tz Казахстан`\n"
+                "• `/tz Moscow` или `/tz Москва`\n"
+                "• `/tz Tashkent` или `/tz Ташкент`\n"
+                "• `/tz Seoul` или `/tz Корея`\n"
+                "• `/tz +5` или `/tz UTC+3`\n\n"
+                "Или просто нажми /tz без параметров и выбери кнопкой!"
+            )
+            return
+        saved = set_user_timezone(uid, resolved)
+        now_dt, tz_name, offset_str = get_user_now(uid)
+        await e.reply(
+            f"✅ **Часовой пояс успешно сохранён!**\n\n"
+            f"📍 Пояс: **{saved}** (`{offset_str}`)\n"
+            f"🕒 Твоё текущее время: **{now_dt.strftime('%H:%M (%d.%m.%Y)')}**\n\n"
+            "Теперь все напоминания, календарь и ответы ИИ работают по твоему местному времени."
+        )
+        return
+
+    text, buttons = format_timezone_panel(uid)
+    await e.reply(text, buttons=buttons)
 
 @client.on(events.NewMessage(pattern=r'^/(connectgoogle|connectcalendar|connectgmail|reconnect)(@\w+)?(\s|$)'))
 async def connect_gmail(e):
