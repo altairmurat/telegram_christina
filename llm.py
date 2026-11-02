@@ -1,4 +1,4 @@
-import os, re, asyncio, requests, urllib.parse
+import os, re, asyncio, requests
 from collections import defaultdict, deque
 from google import genai
 from google.genai import types
@@ -158,7 +158,6 @@ class UserIntent(BaseModel):
             "'everytime' ONLY if user explicitly asks to check/parse/scan Everytime / 에브리타임 / еверитайм (e.g. 'чекни еверитайм', 'что пишут на everytime', 'парсни еверитайм'); "
             "do NOT use 'portal' or 'everytime' if user asks follow-up questions about an already shown post, asks for a link, or asks 'what does this mean' (use 'chat' for those!); "
             "'group_query' if user asks to check, find, summarize, or search messages, topics, announcements, or discussions in the Telegram group/topics/chat; "
-            "'media' if user asks to send, find, recommend, or give a movie, film, TV series, anime, or cartoon (e.g. 'скинь фильм ...', 'скинь сериал ...', 'найди фильм ...', 'посоветуй фильм'); "
             "'chat' for everything else (including questions about previously shown photos, DGIST notices, or Everytime posts)"
         )
     )
@@ -185,8 +184,6 @@ class UserIntent(BaseModel):
     recipient_email: str = Field(default="", description="Email address if explicitly provided")
     sender_name: str = Field(default="", description="Sender name if specified")
     pdf_filename: str = Field(default="document.pdf", description="Short English filename ending with .pdf, e.g. electrodynamics.pdf")
-    is_media: bool = Field(default=False, description="True if intent == 'media' or user asks for a movie/series/anime")
-    media_query: str = Field(default="", description="Name or description of the requested movie or TV series")
 
 EmailIntent = UserIntent
 
@@ -210,7 +207,6 @@ async def parse_user_intent(text: str) -> UserIntent:
         elif data.intent == "everytime": data.is_everytime = True
         elif data.intent == "group_query": data.is_group_query = True
         elif data.intent == "calendar": data.is_calendar = True
-        elif data.intent == "media": data.is_media = True
         return data
     except Exception:
         return UserIntent(intent="chat")
@@ -468,66 +464,4 @@ async def detect_photo_video_intent(prompt_text: str) -> tuple[bool, str]:
     if intent.is_video or any(t in low for t in ("сгенерируй видео", "сделай видео", "создай видео", "оживи", "анимируй", "generate video", "make a video", "видео на")):
         return True, (intent.video_prompt_en or "")
     return False, ""
-
-
-class MediaDetails(BaseModel):
-    title_ru: str = Field(description="Название фильма или сериала на русском языке")
-    title_orig: str = Field(description="Оригинальное название и годы выпуска, например 'Breaking Bad (2008–2013)'")
-    media_type: str = Field(description="Тип: Фильм, Сериал, Мультфильм, Аниме, Мини-сериал")
-    year: str = Field(description="Год или диапазон лет выпуска")
-    genre: str = Field(description="Жанры через запятую")
-    director_or_creator: str = Field(description="Режиссёр или создатель")
-    rating: str = Field(description="Примерный рейтинг, например 'Кинопоиск ~8.9 / IMDb ~9.5'")
-    short_description: str = Field(description="Увлекательное краткое описание сюжета (2-3 предложения) без спойлеров")
-    why_watch: str = Field(description="Почему стоит посмотреть (1-2 предложения)")
-
-
-async def get_media_recommendation(query: str, user_id: int | None = None) -> str:
-    """Формирует подробную карточку фильма/сериала с рейтингом, сюжетом и ссылками на онлайн-просмотр."""
-    prompt = f"Пользователь попросил скинуть/посоветовать фильм или сериал: '{query}'. Подбери наиболее точный фильм или сериал и предоставь подробные данные."
-    cfg = types.GenerateContentConfig(
-        system_instruction="Ты эксперт по кино и персональный ассистент Кристина. Выдай точные, правдивые сведения о запрашиваемом фильме или сериале.",
-        response_mime_type="application/json",
-        response_schema=MediaDetails,
-        temperature=0.3
-    )
-    res = await client.aio.models.generate_content(model=MODEL, contents=prompt, config=cfg)
-    try:
-        m = MediaDetails.model_validate_json(res.text or "{}")
-        search_query = f"{m.title_ru} {m.year}".strip() if m.title_ru else query
-    except Exception:
-        m = None
-        search_query = query
-
-    q_enc = urllib.parse.quote(search_query)
-    kp_url = f"https://www.kinopoisk.ru/index.php?kp_query={q_enc}"
-    ivi_url = f"https://www.ivi.ru/search/?q={q_enc}"
-    okko_url = f"https://okko.tv/search/{q_enc}"
-    watch_url = f"https://yandex.ru/search/?text={q_enc}+смотреть+онлайн"
-
-    if m and m.title_ru:
-        text = (
-            f"🎬 **{m.title_ru}** ({m.title_orig})\n"
-            f"📌 **Тип:** {m.media_type} | **Год:** {m.year}\n"
-            f"🎭 **Жанр:** {m.genre}\n"
-            f"👤 **Режиссёр / Создатель:** {m.director_or_creator}\n"
-            f"⭐️ **Рейтинг:** {m.rating}\n\n"
-            f"📖 **Сюжет:**\n{m.short_description}\n\n"
-            f"💡 **Почему стоит посмотреть:**\n{m.why_watch}\n\n"
-            f"🍿 **Где посмотреть / найти:**\n"
-            f"• [Смотреть онлайн (Яндекс поиск)]({watch_url})\n"
-            f"• [Страница на Кинопоиске]({kp_url})\n"
-            f"• [Поиск на Ivi]({ivi_url})\n"
-            f"• [Поиск на Okko]({okko_url})"
-        )
-    else:
-        text = (
-            f"🎬 **Вот что я нашла по запросу «{query}»:**\n\n"
-            f"🍿 **Ссылки для просмотра и информации:**\n"
-            f"• [Смотреть онлайн (Яндекс поиск)]({watch_url})\n"
-            f"• [Найти на Кинопоиске]({kp_url})\n"
-            f"• [Найти на Ivi]({ivi_url})\n"
-            f"• [Найти на Okko]({okko_url})"
-        )
-    return text
 
