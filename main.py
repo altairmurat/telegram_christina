@@ -227,10 +227,24 @@ def find_email_in_history(gmail, name: str) -> str | None:
     except Exception: pass
     return None
 
+def clean_email_address(raw: str | None) -> str:
+    """Вытаскивает чистый валидный email без лишних пробелов, точек на конце и мусорных слов."""
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    if s.lower() in ("none", "null", "undefined", "false"):
+        return ""
+    m = re.search(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", s)
+    if not m:
+        return ""
+    return m.group(0).rstrip(".,;:!?'\"")
+
 def create_gmail_draft(gmail, to: str, subject: str, body: str) -> str:
     msg = EmailMessage()
-    msg['To'], msg['Subject'] = to, subject
-    msg.set_content(body, charset='utf-8')
+    clean_to = clean_email_address(to) or (to.strip() if to else "")
+    msg['To'] = clean_to
+    msg['Subject'] = (subject or "Без темы").strip()
+    msg.set_content(body or "", charset='utf-8')
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     return gmail.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()["id"]
 
@@ -262,7 +276,7 @@ async def apply_draft_update(draft_id: str, new_text: str, user_id: int, message
             hdrs = info.get("message", {}).get("payload", {}).get("headers", [])
             to_val = next((h["value"] for h in hdrs if h.get("name", "").lower() == "to"), "")
             subj_val = next((h["value"] for h in hdrs if h.get("name", "").lower() == "subject"), "Без темы")
-            msg = EmailMessage(); msg['To'], msg['Subject'] = to_val, subj_val
+            msg = EmailMessage(); msg['To'], msg['Subject'] = clean_email_address(to_val) or to_val, subj_val
             msg.set_content(new_text, charset='utf-8')
             raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
             await asyncio.to_thread(gmail.users().drafts().update(userId="me", id=draft_id, body={"message": {"raw": raw}}).execute)
@@ -274,10 +288,12 @@ async def apply_draft_update(draft_id: str, new_text: str, user_id: int, message
         except Exception as e: print(f"Edit msg error: {e}")
 
 async def send_draft_to_telegram(event, gmail, user_id: int, to: str, name: str, topic: str, s_name: str):
-    subj, body = await generate_email_text(topic, name, s_name)
-    draft_id = await asyncio.to_thread(create_gmail_draft, gmail, to, subj, body)
+    clean_to = clean_email_address(to) or to.strip()
+    subj, body = await generate_email_text(topic, name or clean_to, s_name)
+    draft_id = await asyncio.to_thread(create_gmail_draft, gmail, clean_to, subj, body)
     draft_cache[draft_id], text_cache[draft_id] = user_id, body
-    txt = f"📧 Черновик для {name} ({to})\n\nТема: {subj}\n\n{body}"
+    target_label = f"{name} ({clean_to})" if (name and name != clean_to) else clean_to
+    txt = f"📧 Черновик для {target_label}\n\nТема: {subj}\n\n{body}"
     msg = await event.reply(txt)
     try:
         await msg.edit(txt, buttons=make_draft_keyboard(draft_id, msg.id, user_id))
@@ -642,12 +658,24 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
             msgs = search_group_messages(topic_name=intent.group_topic_name, chat_id=allowed_cids, limit=15) if allowed_cids else []
             if msgs:
                 topic_text += f"\n\nДанные из группы:\n{format_messages_for_prompt(msgs)}"
-        em = intent.recipient_email or await asyncio.to_thread(find_email_in_history, gmail, intent.recipient_name)
+        # Сначала ищем прямой email прямо в тексте запроса или в структурированном выводе Gemini
+        explicit_em = clean_email_address(text)
+        intent_em = clean_email_address(intent.recipient_email)
+        em = explicit_em or intent_em
+
+        # Если явного email нет, пробуем найти контакт в истории отправленных/полученных писем
+        if not em and intent.recipient_name:
+            candidate = await asyncio.to_thread(find_email_in_history, gmail, intent.recipient_name)
+            em = clean_email_address(candidate)
+
         if not em:
-            user_states[user_id] = ("waiting_for_manual_email", intent.recipient_name, topic_text, intent.sender_name)
-            await event.reply(f"Не нашёл email для {intent.recipient_name}. Пришли его почту одним сообщением:")
+            target_name = intent.recipient_name or "получателя"
+            user_states[user_id] = ("waiting_for_manual_email", target_name, topic_text, intent.sender_name)
+            await event.reply(f"Не нашла email для {target_name}. Пришли его почту одним сообщением (или /cancel):")
             return True
-        await send_draft_to_telegram(event, gmail, user_id, em, intent.recipient_name, topic_text, intent.sender_name)
+
+        rec_name = intent.recipient_name if (intent.recipient_name and intent.recipient_name != em) else em
+        await send_draft_to_telegram(event, gmail, user_id, em, rec_name, topic_text, intent.sender_name)
     except RefreshError:
         delete_user_token(user_id)
         await event.reply(f"⚠️ Токен Gmail истёк: {build_auth_url(user_id)}")
@@ -1277,11 +1305,11 @@ async def necessary_task_handler(event):
 
     if isinstance(state, tuple) and state[0] == "waiting_for_manual_email":
         _, name, topic, s_name = state
-        m = re.search(r"[\w.+-]+@[\w.-]+", event.text or "")
-        if m:
+        clean_em = clean_email_address(event.text or "")
+        if clean_em:
             gmail = await asyncio.to_thread(get_gmail_client_for, uid)
             user_states.pop(uid, None)
-            if gmail: await send_draft_to_telegram(event, gmail, uid, m.group(0), name, topic, s_name)
+            if gmail: await send_draft_to_telegram(event, gmail, uid, clean_em, name, topic, s_name)
             else: await event.reply(f"Сессия не найдена. Авторизуйся: {build_auth_url(uid)}")
         else: await event.reply("Это не похоже на email. Попробуй ещё раз или введи /cancel")
         return

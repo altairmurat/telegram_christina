@@ -188,7 +188,7 @@ class UserIntent(BaseModel):
     group_search_query: str = Field(default="", description="Key terms or topic to search within group messages")
     recipient_name: str = Field(default="", description="Name of recipient if email")
     topic: str = Field(default="", description="Topic of the email or detailed topic/instructions for the PDF")
-    recipient_email: str = Field(default="", description="Email address if explicitly provided")
+    recipient_email: str = Field(default="", description="Strict, clean email address (e.g. pr@dgist.ac.kr) if explicitly mentioned in user prompt, else empty string. Do not include names or phrases.")
     sender_name: str = Field(default="", description="Sender name if specified")
     pdf_filename: str = Field(default="document.pdf", description="Short English filename ending with .pdf, e.g. electrodynamics.pdf")
 
