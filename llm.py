@@ -10,8 +10,8 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-# 10 пар сообщений (10 от пользователя + 10 ответов ассистента = 20 элементов)
-user_contexts = defaultdict(lambda: deque(maxlen=20))
+# 5 пар сообщений (5 от пользователя + 5 ответов ассистента = 10 элементов)
+user_contexts = defaultdict(lambda: deque(maxlen=10))
 # Хранилище последних объявлений портала DGIST (полный текст + ссылки) для каждого пользователя
 portal_context_store: dict[int, str] = {}
 
