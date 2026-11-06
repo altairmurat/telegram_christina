@@ -451,6 +451,9 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         return True
 
     if intent.is_portal:
+        if not is_owner(user_id):
+            await event.reply("⛔ Проверка и парсинг портала DGIST доступны только создателю бота.")
+            return True
         await run_portal_check(event)
         return True
 
@@ -851,7 +854,7 @@ async def startup_event():
                 types.BotCommand("everytime", "Журнал постов DGIST Everytime с переводом"),
                 types.BotCommand("etkeywords", "Ключевые слова для фильтра Everytime"),
                 types.BotCommand("connecteverytime", "Подключить DGIST Everytime"),
-                types.BotCommand("checkportal", "Проверить объявления DGIST"),
+                types.BotCommand("checkportal", "Проверить объявления DGIST (Owner)"),
                 types.BotCommand("connectmyportal", "Подключить портал DGIST"),
                 types.BotCommand("disconnectportal", "Отключить портал DGIST"),
                 types.BotCommand("calendar", "Ближайшие планы в Google Календаре"),
@@ -916,9 +919,9 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 • /everytime — журнал постов с DGIST Everytime (с переводом слово в слово)
 • /etkeywords — ключевые слова для фильтрации Everytime
 • /connecteverytime — подключить DGIST Everytime
-• /checkportal — проверить объявления DGIST
-• /connectmyportal — подключить портал DGIST (в ЛС)
-• /disconnectportal — отключить портал DGIST
+• /checkportal — проверить объявления DGIST (Owner)
+• /connectmyportal — подключить портал DGIST (Owner)
+• /disconnectportal — отключить портал DGIST (Owner)
 • /calendar — ближайшие планы в календаре
 • /timezone (/tz) — настроить часовой пояс (Корея, Казахстан, Россия, Узбекистан и др.)
 • /connectgoogle — подключить Google (Календарь и Gmail)

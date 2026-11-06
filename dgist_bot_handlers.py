@@ -7,6 +7,12 @@ from dgist_accounts import (
     save_dgist_group_target, load_dgist_group_target, get_dgist_last_check_age_sec
 )
 from llm import store_portal_context
+from env import OWNER_ID
+
+def is_owner(user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    return int(user_id) == int(OWNER_ID)
 
 _active_portal_checks = set()
 AUTO_CHECK_INTERVAL_SEC = 33 * 60 * 60
@@ -88,6 +94,9 @@ def get_topic_id(event) -> int | None:
 def remember_group_topic(event):
     if event.is_private:
         return
+    # Привязывать группу/топик для оповещений портала может только владелец
+    if not is_owner(event.sender_id):
+        return
     tid = get_topic_id(event)
     target = {"chat_id": event.chat_id, "topic_id": tid}
     try:
@@ -126,14 +135,11 @@ def is_active_group_topic(event) -> bool:
     return bool(target and target.get("chat_id") == event.chat_id and target.get("topic_id") == tid)
 
 async def run_portal_check(e):
+    if not is_owner(e.sender_id):
+        return await e.reply("⛔ Проверка и парсинг портала DGIST доступны только создателю бота.")
     remember_group_topic(e)
     uid = e.sender_id
     acc = await asyncio.to_thread(load_dgist_account, uid)
-    if not acc:
-        all_uids = await asyncio.to_thread(list_dgist_user_ids)
-        if all_uids:
-            uid = all_uids[0]
-            acc = await asyncio.to_thread(load_dgist_account, uid)
     if not acc:
         return await e.reply("Портал ещё не подключён. Сначала: /connectmyportal")
     if uid in _active_portal_checks:
@@ -161,9 +167,7 @@ async def run_portal_check(e):
             if not posts_to_show:
                 await status_msg.edit(header)
             else:
-                store_portal_context(e.sender_id, posts_to_show)
-                if uid != e.sender_id:
-                    store_portal_context(uid, posts_to_show)
+                store_portal_context(uid, posts_to_show)
                 mag_id = create_portal_magazine(uid, posts_to_show, header)
                 text, buttons = format_portal_magazine_page(portal_magazines[mag_id], 0)
                 await status_msg.edit(text, buttons=buttons, link_preview=False)
@@ -177,11 +181,15 @@ def register_dgist_handlers(client, user_states: dict):
 
     @client.on(events.NewMessage(pattern=r'^/connectmyportal(@\w+)?(\s|$)'))
     async def connect_portal(e):
+        if not is_owner(e.sender_id):
+            return await e.reply("⛔ Подключение портала DGIST доступно только создателю бота.")
         user_states[e.sender_id] = "waiting_for_dgist_username"
         await e.reply("🎓 **Подключение DGIST портала** (1/4)\n\nВведи свой логин от портала:")
 
     @client.on(events.NewMessage(pattern=r'^/disconnectportal(@\w+)?(\s|$)'))
     async def disconnect_portal(e):
+        if not is_owner(e.sender_id):
+            return await e.reply("⛔ Доступ запрещён.")
         await asyncio.to_thread(delete_dgist_account, e.sender_id)
         user_states.pop(e.sender_id, None)
         await e.reply("🗑 Данные портала удалены.")
@@ -197,6 +205,8 @@ def register_dgist_handlers(client, user_states: dict):
 
     @client.on(events.CallbackQuery(pattern=rb"^dgmag:"))
     async def handle_magazine_pagination(event):
+        if not is_owner(event.sender_id):
+            return await event.answer("⛔ Журнал портала DGIST доступен только создателю бота.", alert=True)
         data = event.data.decode("utf-8", errors="ignore")
         if data == "dgmag:noop":
             await event.answer("Листай страницы кнопками ⬅️ Назад / Вперёд ➡️")
@@ -211,14 +221,12 @@ def register_dgist_handlers(client, user_states: dict):
             return
 
         mag = portal_magazines.get(mag_id)
+        if mag and mag.get("uid") and mag.get("uid") != event.sender_id:
+            return await event.answer("⛔ Это журнал другого пользователя.", alert=True)
+
         if not mag:
             uid = event.sender_id
             db_seen = await asyncio.to_thread(load_dgist_seen_ids, uid)
-            if not db_seen:
-                all_uids = await asyncio.to_thread(list_dgist_user_ids)
-                if all_uids:
-                    uid = all_uids[0]
-                    db_seen = await asyncio.to_thread(load_dgist_seen_ids, uid)
             recent = (db_seen or {}).get("__recent_posts__") if isinstance(db_seen, dict) else None
             if not recent:
                 await event.answer("Журнал устарел. Напиши /checkportal для обновления!", alert=True)
@@ -301,6 +309,8 @@ async def _auto_monitor_loop(client):
     while True:
         try:
             for uid in await asyncio.to_thread(list_dgist_user_ids):
+                if not is_owner(uid):
+                    continue
                 if uid in _active_portal_checks: continue
                 # Если в БД уже есть свежая проверка (< 33 часов назад), не дёргаем портал при каждом редеплое Render!
                 age_sec = await asyncio.to_thread(get_dgist_last_check_age_sec, uid)
@@ -359,6 +369,8 @@ def _run_login_subprocess(uid: int, account: dict):
         raise RuntimeError(f"Логин не удался: {tail[-400:]}")
 
 async def handle_dgist_conversation_step(event, uid: int, state, user_states: dict) -> bool:
+    if not is_owner(uid):
+        return False
     txt = (event.text or "").strip()
     if state == "waiting_for_dgist_username":
         if not txt: return await event.reply("Логин не может быть пустым.")

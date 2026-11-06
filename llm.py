@@ -45,6 +45,9 @@ def store_portal_context(user_id: int | None, posts: list[dict]) -> None:
     """Сохраняет вытащенные объявления с портала (включая полный текст и ссылки на регистрацию) в контекст пользователя."""
     if not posts or not user_id:
         return
+    from env import OWNER_ID
+    if int(user_id) != int(OWNER_ID):
+        return
     ctx_text = format_portal_posts_for_context(posts)
     if not ctx_text:
         return
@@ -71,6 +74,9 @@ def store_portal_context(user_id: int | None, posts: list[dict]) -> None:
 
 def _get_portal_context_for_user(user_id: int | None) -> str:
     if not user_id:
+        return ""
+    from env import OWNER_ID
+    if int(user_id) != int(OWNER_ID):
         return ""
     uid = int(user_id)
     ctx = portal_context_store.get(uid)
