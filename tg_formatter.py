@@ -195,6 +195,41 @@ async def safe_reply(event, text: str, **kwargs):
             last_msg = await event.reply(clean, parse_mode=None, **kwargs)
     return last_msg
 
+async def safe_reply_streamed(event, text: str, delay: float = 1.5, **kwargs):
+    """
+    Отправляет длинный ответ на сообщение кусочками (по предложениям/абзацам) 
+    с задержкой в 1-2 секунды, чтобы бот выглядел как живой человек.
+    """
+    if not text:
+        return None
+    # Разбиваем текст на абзацы и предложения (сохраняя знаки препинания)
+    raw_parts = re.split(r'(?<=[.!?\n])\s+', text.strip())
+    sentences = [p.strip() for p in raw_parts if p.strip()]
+    if not sentences:
+        return await safe_reply(event, text, **kwargs)
+
+    # Собираем предложения обратно в небольшие осмысленные кусочки (до 3-4 предложений или 300 символов на пачку)
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    for s in sentences:
+        if current_len + len(s) > 350 and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [s]
+            current_len = len(s)
+        else:
+            current_chunk.append(s)
+            current_len += len(s) + 1
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    last_msg = None
+    for idx, chunk in enumerate(chunks):
+        if idx > 0:
+            await asyncio.sleep(delay)
+        last_msg = await safe_reply(event, chunk, **kwargs)
+    return last_msg
+
 
 async def safe_send_message(client, entity, text: str, **kwargs):
     """Безопасная отправка сообщения с parse_mode='html'."""
