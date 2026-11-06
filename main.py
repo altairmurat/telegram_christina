@@ -40,6 +40,7 @@ from timezone_helper import (
     get_user_timezone, set_user_timezone, get_user_now,
     sync_google_calendar_timezone, resolve_timezone_name
 )
+from tg_formatter import safe_reply, safe_edit_message, safe_send_message, format_tg_html
 from fal_video import (
     is_owner, is_video_admin, add_video_admins, remove_video_admins,
     list_video_admins, check_video_quota, record_video_generation,
@@ -227,6 +228,12 @@ def find_email_in_history(gmail, name: str) -> str | None:
     except Exception: pass
     return None
 
+def strip_bot_mentions(text: str | None) -> str:
+    """Удаляет только упоминания бота (@bot_username), не трогая email адреса (например pr@dgist.ac.kr)."""
+    if not text:
+        return ""
+    return re.sub(r"(?<![\w.+-])@\w+", "", text).strip()
+
 def clean_email_address(raw: str | None) -> str:
     """Вытаскивает чистый валидный email без лишних пробелов, точек на конце и мусорных слов."""
     if not raw:
@@ -241,8 +248,9 @@ def clean_email_address(raw: str | None) -> str:
 
 def create_gmail_draft(gmail, to: str, subject: str, body: str) -> str:
     msg = EmailMessage()
-    clean_to = clean_email_address(to) or (to.strip() if to else "")
-    msg['To'] = clean_to
+    clean_to = clean_email_address(to)
+    if clean_to:
+        msg['To'] = clean_to
     msg['Subject'] = (subject or "Без темы").strip()
     msg.set_content(body or "", charset='utf-8')
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -276,7 +284,11 @@ async def apply_draft_update(draft_id: str, new_text: str, user_id: int, message
             hdrs = info.get("message", {}).get("payload", {}).get("headers", [])
             to_val = next((h["value"] for h in hdrs if h.get("name", "").lower() == "to"), "")
             subj_val = next((h["value"] for h in hdrs if h.get("name", "").lower() == "subject"), "Без темы")
-            msg = EmailMessage(); msg['To'], msg['Subject'] = clean_email_address(to_val) or to_val, subj_val
+            msg = EmailMessage()
+            clean_to = clean_email_address(to_val)
+            if clean_to:
+                msg['To'] = clean_to
+            msg['Subject'] = subj_val
             msg.set_content(new_text, charset='utf-8')
             raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
             await asyncio.to_thread(gmail.users().drafts().update(userId="me", id=draft_id, body={"message": {"raw": raw}}).execute)
@@ -288,13 +300,16 @@ async def apply_draft_update(draft_id: str, new_text: str, user_id: int, message
         except Exception as e: print(f"Edit msg error: {e}")
 
 async def send_draft_to_telegram(event, gmail, user_id: int, to: str, name: str, topic: str, s_name: str):
-    clean_to = clean_email_address(to) or to.strip()
+    clean_to = clean_email_address(to)
+    if not clean_to:
+        await safe_reply(event, f"⚠️ Не удалось определить корректный адрес почты ({to or 'не указан'}).")
+        return
     subj, body = await generate_email_text(topic, name or clean_to, s_name)
     draft_id = await asyncio.to_thread(create_gmail_draft, gmail, clean_to, subj, body)
     draft_cache[draft_id], text_cache[draft_id] = user_id, body
     target_label = f"{name} ({clean_to})" if (name and name != clean_to) else clean_to
     txt = f"📧 Черновик для {target_label}\n\nТема: {subj}\n\n{body}"
-    msg = await event.reply(txt)
+    msg = await safe_reply(event, txt)
     try:
         await msg.edit(txt, buttons=make_draft_keyboard(draft_id, msg.id, user_id))
     except Exception:
@@ -496,7 +511,7 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
 
         ctx = format_messages_for_prompt(msgs)
         ans = await answer_with_group_context(text, ctx, user_id=user_id)
-        await event.reply(ans)
+        await safe_reply(event, ans)
         return True
 
     if intent.is_pdf:
@@ -681,7 +696,13 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         await send_draft_to_telegram(event, gmail, user_id, em, rec_name, topic_text, intent.sender_name)
     except RefreshError:
         delete_user_token(user_id)
-        await event.reply(f"⚠️ Токен Gmail истёк: {build_auth_url(user_id)}")
+        await safe_reply(event, f"⚠️ Токен Gmail истёк: {build_auth_url(user_id)}")
+    except Exception as ex:
+        err_text = str(ex)
+        if "Invalid To header" in err_text:
+            await safe_reply(event, "❌ Неверный формат адреса получателя (email). Проверь правильность адреса почты.")
+        else:
+            await safe_reply(event, f"❌ Ошибка при создании черновика: {ex}")
     return True
 
 @client.on(events.CallbackQuery)
@@ -1351,7 +1372,7 @@ async def necessary_task_handler(event):
             if vb:
                 prompt_txt = await transcribe_voice(vb)
         elif event.text:
-            prompt_txt = re.sub(r"@\w+", "", event.text).strip() or event.text
+            prompt_txt = strip_bot_mentions(event.text) or event.text
 
         if not prompt_txt:
             await event.reply("Пожалуйста, напиши текстом или скажи голосом, что сделать с PDF-файлом (или напиши /cancel):")
@@ -1372,7 +1393,7 @@ async def necessary_task_handler(event):
                 filename=fname,
                 user_id=uid
             )
-            await st.edit(ans)
+            await safe_edit_message(st, ans)
         except Exception as ex:
             await st.edit(f"❌ Ошибка обработки PDF: {ex}")
         return
@@ -1390,7 +1411,7 @@ async def necessary_task_handler(event):
     if is_pdf_doc:
         caption = (event.raw_text or "").strip()
         if caption:
-            caption = re.sub(r"@\w+", "", caption).strip() or caption
+            caption = strip_bot_mentions(caption) or caption
 
         st = await event.reply(f"📥 Загружаю PDF «{pdf_filename}»...")
         try:
@@ -1433,7 +1454,7 @@ async def necessary_task_handler(event):
             if txt:
                 if not await try_handle_email_intent(event, uid, txt):
                     ans = await ask_gemini(txt, user_id=uid)
-                    await event.reply(ans)
+                    await safe_reply(event, ans)
                     await asyncio.to_thread(save_communication, sender.username if sender else None, txt)
             else: await event.reply("Не удалось распознать речь.")
         except Exception as ex: await event.reply(f"Ошибка аудио: {ex}")
@@ -1449,7 +1470,7 @@ async def necessary_task_handler(event):
         if len(pending_photos[uid]) < 10:
             pending_photos[uid].append(event.message)
         if event.raw_text and event.raw_text.strip():
-            pending_captions[uid] = re.sub(r"@\w+", "", event.raw_text).strip() or event.raw_text.strip()
+            pending_captions[uid] = strip_bot_mentions(event.raw_text) or event.raw_text.strip()
 
         async def _flush_photos(u=uid, ev=event):
             await asyncio.sleep(0.8)
@@ -1468,7 +1489,7 @@ async def necessary_task_handler(event):
                     st = await ev.reply(f"⏳ Обрабатываю фото ({len(msgs)} шт.)...")
                     try:
                         ans = await process_telegram_images(msgs, cap, user_id=u)
-                        await st.edit(ans)
+                        await safe_edit_message(st, ans)
                     except Exception as ex:
                         await st.edit(f"❌ Ошибка: {ex}")
             else:
@@ -1485,7 +1506,7 @@ async def necessary_task_handler(event):
         pending_captions.pop(uid, None)
         user_states.pop(uid, None)
         if msgs:
-            clean_txt = re.sub(r"@\w+", "", event.text).strip() or event.text
+            clean_txt = strip_bot_mentions(event.text) or event.text
             is_vid, vid_prompt_en = await detect_photo_video_intent(clean_txt)
             if is_vid:
                 uname = getattr(sender, "username", None) if sender else None
@@ -1495,15 +1516,15 @@ async def necessary_task_handler(event):
             st = await event.reply(f"⏳ Обрабатываю фото ({len(msgs)} шт.)...")
             try:
                 ans = await process_telegram_images(msgs, clean_txt, user_id=uid)
-                await st.edit(ans)
+                await safe_edit_message(st, ans)
             except Exception as ex:
                 await st.edit(f"❌ Ошибка: {ex}")
 
     elif event.text:
-        clean_txt = re.sub(r"@\w+", "", event.text).strip() or event.text
+        clean_txt = strip_bot_mentions(event.text) or event.text
         try:
             if not await try_handle_email_intent(event, uid, clean_txt):
                 ans = await ask_gemini(clean_txt, user_id=uid)
-                await event.reply(ans)
+                await safe_reply(event, ans)
                 await asyncio.to_thread(save_communication, sender.username if sender else None, clean_txt)
         except Exception as ex: await event.reply(f"Ошибка: {ex}")

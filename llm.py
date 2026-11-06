@@ -230,6 +230,19 @@ async def parse_user_intent(text: str, user_id: int | None = None) -> UserIntent
     except Exception:
         return UserIntent(intent="chat")
 
+TG_HTML_STYLE_INSTRUCTION = (
+    "\n\nПравила вёрстки сообщений для Telegram (HTML):\n"
+    "Оформляй свои ответы аккуратно и красиво, используя валидные Telegram HTML-теги:\n"
+    "- <b>жирный текст</b> для заголовков, имён и ключевых акцентов\n"
+    "- <i>курсив</i> для пояснений, мыслей или переводов\n"
+    "- <code>термин</code> для команд, путей, ID и переменных\n"
+    "- <pre><code class=\"language-python\">код</code></pre> для блоков кода\n"
+    "- <blockquote>важная мысль или цитата</blockquote> для цитат и главных выводов\n"
+    "- <a href=\"URL\">текст ссылки</a> для кликабельных ссылок\n"
+    "- НИКОГДА не используй Markdown-звёздочки (**) и решётки (##). Все HTML-теги должны быть корректно закрыты.\n"
+    "- Разделяй абзацы обычными переводами строк."
+)
+
 async def answer_with_group_context(user_query: str, group_context_text: str, user_id: int | None = None) -> str:
     """Генерирует ответ пользователю на основе сообщений из группы."""
     hist = user_contexts[user_id]
@@ -247,7 +260,7 @@ async def answer_with_group_context(user_query: str, group_context_text: str, us
 
     hist.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
     cfg = types.GenerateContentConfig(
-        system_instruction="Ты персональный ассистент Кристина. Ты помогаешь ориентироваться в сообщениях и топиках группы Telegram. Отвечай кратко, понятно и дружелюбно.",
+        system_instruction="Ты персональный ассистент Кристина. Ты помогаешь ориентироваться в сообщениях и топиках группы Telegram. Отвечай кратко, понятно и дружелюбно." + TG_HTML_STYLE_INSTRUCTION,
         temperature=0.4
     )
     res = await client.aio.models.generate_content(model=MODEL, contents=list(hist), config=cfg)
@@ -291,6 +304,7 @@ async def process_pdf_document(
             "Ты персональный ассистент Кристина. Внимательно изучи прикреплённый PDF-документ и ответь на запрос пользователя "
             "подробно, структурированно, точно и понятно на русском языке (или на языке запроса пользователя). "
             "Ты помнишь содержание этого документа и сможешь отвечать на последующие уточняющие вопросы пользователя по нему."
+            + TG_HTML_STYLE_INSTRUCTION
         ),
         temperature=0.4
     )
@@ -335,7 +349,7 @@ async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
         )
 
     cfg = types.GenerateContentConfig(
-        system_instruction=sys_inst,
+        system_instruction=sys_inst + TG_HTML_STYLE_INSTRUCTION,
         temperature=0.7
     )
     res = await client.aio.models.generate_content(model=MODEL, contents=list(hist), config=cfg)
@@ -367,7 +381,7 @@ async def process_telegram_images(messages, user_prompt: str, user_id: int | Non
     hist = user_contexts[user_id]
     user_turn = types.Content(role="user", parts=parts)
     cfg = types.GenerateContentConfig(
-        system_instruction="Ты персональный ассистент Кристина. Проанализируй все переданные изображения и ответь на запрос пользователя.",
+        system_instruction="Ты персональный ассистент Кристина. Проанализируй все переданные изображения и ответь на запрос пользователя." + TG_HTML_STYLE_INSTRUCTION,
         temperature=0.7
     )
     res = await client.aio.models.generate_content(
