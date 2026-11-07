@@ -332,16 +332,8 @@ async def _auto_monitor_loop(client):
                             header = f"🔔 **Новые объявления DGIST ({len(posts)} шт.):**"
                             mag_id = create_portal_magazine(uid, posts, header)
                             text, buttons = format_portal_magazine_page(portal_magazines[mag_id], 0)
-                            await client.send_message(uid, text, buttons=buttons, link_preview=False)
-                            gt = await asyncio.to_thread(load_group_target)
-                            if gt and gt.get("chat_id") and gt.get("chat_id") != uid:
-                                await client.send_message(
-                                    gt["chat_id"],
-                                    text,
-                                    buttons=buttons,
-                                    reply_to=gt.get("topic_id"),
-                                    link_preview=False,
-                                )
+                            if is_owner(uid):
+                                await client.send_message(uid, text, buttons=buttons, link_preview=False)
                 except Exception as ex:
                     print(f"[AUTO] Ошибка user={uid}: {ex}")
                 finally:
