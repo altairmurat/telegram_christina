@@ -13,8 +13,8 @@ import asyncio
 import edge_tts
 
 DEFAULT_VOICE = "ru-RU-SvetlanaNeural"
-DEFAULT_PITCH = "+22Hz"
-DEFAULT_RATE = "+8%"
+DEFAULT_PITCH = "+5Hz"
+DEFAULT_RATE = "-2%"
 
 # Порог длины текста (в символах без тегов), при превышении которого ответ отправляется голосовым сообщением
 LONG_TEXT_VOICE_THRESHOLD = 250
@@ -23,7 +23,7 @@ MAX_VOICE_CHARS = 1200
 
 
 def clean_text_for_speech(text: str) -> str:
-    """Очищает текст от HTML-тегов, ссылок, блоков кода и markdown-артефактов для естественной озвучки."""
+    """Очищает текст от HTML-тегов, ссылок, блоков кода, эмодзи и markdown-артефактов для естественной озвучки."""
     if not text:
         return ""
     # 1. Удаляем блоки кода
@@ -34,11 +34,14 @@ def clean_text_for_speech(text: str) -> str:
     s = re.sub(r"<[^>]+>", "", s)
     # 3. Удаляем оставшиеся сырые URL-адреса
     s = re.sub(r"https?://\S+", "", s)
-    # 4. Удаляем markdown-символы
+    # 4. Удаляем списочные маркеры и markdown-символы
+    s = re.sub(r"^\s*[-*•\d]\.?\s*", "", s, flags=re.M)
     s = re.sub(r"[#*_~`>]", "", s)
-    # 5. Заменяем спецсущности
+    # 5. Удаляем эмодзи, чтобы синтезатор речи не читал их названия
+    s = re.sub(r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff]", "", s)
+    # 6. Заменяем спецсущности
     s = s.replace("&amp;", "и").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
-    # 6. Убираем лишние пробелы и переносы
+    # 7. Убираем лишние пробелы и переносы
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
