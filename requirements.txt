@@ -9,8 +9,9 @@ requests
 beautifulsoup4
 playwright
 cryptography
-google-genai
+google-genai>=2.30.0
 google-auth
 google-auth-oauthlib
 google-api-python-client
 edge-tts
+soundfile
