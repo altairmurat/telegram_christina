@@ -175,18 +175,36 @@ def login_and_get_cookie(
             if not loaded:
                 page.goto(PORTAL_LOGIN_URL, wait_until="commit", timeout=45000)
 
-            try:
-                page.wait_for_selector(f"{USER_MARKER}, {USERNAME_SEL}", timeout=20000)
-            except Exception:
-                pass
-
-            try:
-                page.wait_for_selector(USER_MARKER, timeout=3000)
-                alive = True
-            except Exception:
-                alive = False
+            # Ждём завершения цепочки редиректов SSO (до 25 секунд)
+            alive = False
+            start_wait = time.time()
+            while time.time() - start_wait < 25:
+                curr_url = page.url.lower()
+                try:
+                    # Если пользователь уже авторизован и открылся профиль/портал
+                    if "my.dgist.ac.kr" in curr_url and "login" not in curr_url and page.locator(USER_MARKER).count() > 0:
+                        alive = True
+                        break
+                    # Если перенаправило на страницу логина (auth.dgist.ac.kr или форма с loginID)
+                    if page.locator(USERNAME_SEL).count() > 0:
+                        alive = False
+                        break
+                except Exception:
+                    # Контекст страницы мог пересоздаться во время навигации/редиректа
+                    pass
+                page.wait_for_timeout(500)
 
             if not alive:
+                # Если форма логина так и не появилась за 25 секунд, проверяем ещё раз маркер
+                if page.locator(USERNAME_SEL).count() == 0:
+                    try:
+                        if page.locator(USER_MARKER).count() > 0:
+                            alive = True
+                    except Exception:
+                        pass
+                if not alive and page.locator(USERNAME_SEL).count() == 0:
+                    raise RuntimeError(f"Страница входа не загрузилась вовремя. Текущий URL: {page.url}")
+
                 page.fill(USERNAME_SEL, dgist_user)
                 page.fill(PASS_SEL, dgist_pass)
                 click_ts = time.time()
