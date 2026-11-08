@@ -40,7 +40,7 @@ from timezone_helper import (
     get_user_timezone, set_user_timezone, get_user_now,
     sync_google_calendar_timezone, resolve_timezone_name
 )
-from tg_formatter import safe_reply, safe_reply_streamed, safe_edit_message, safe_send_message, format_tg_html
+from tg_formatter import safe_reply, safe_reply_human_streamed, safe_reply_streamed, safe_edit_message, safe_send_message, format_tg_html
 from fal_video import (
     is_owner, is_video_admin, add_video_admins, remove_video_admins,
     list_video_admins, check_video_quota, record_video_generation,
@@ -1453,8 +1453,12 @@ async def necessary_task_handler(event):
             txt = await transcribe_voice(vb)
             if txt:
                 if not await try_handle_email_intent(event, uid, txt):
-                    ans = await ask_gemini(txt, user_id=uid)
-                    await safe_reply(event, ans)
+                    try:
+                        async with client.action(event.chat_id, "typing"):
+                            ans = await ask_gemini(txt, user_id=uid)
+                    except Exception:
+                        ans = await ask_gemini(txt, user_id=uid)
+                    await safe_reply_human_streamed(event, ans)
                     await asyncio.to_thread(save_communication, sender.username if sender else None, txt)
             else: await event.reply("Не удалось распознать речь.")
         except Exception as ex: await event.reply(f"Ошибка аудио: {ex}")
@@ -1524,7 +1528,11 @@ async def necessary_task_handler(event):
         clean_txt = strip_bot_mentions(event.text) or event.text
         try:
             if not await try_handle_email_intent(event, uid, clean_txt):
-                ans = await ask_gemini(clean_txt, user_id=uid)
-                await safe_reply(event, ans)
+                try:
+                    async with client.action(event.chat_id, "typing"):
+                        ans = await ask_gemini(clean_txt, user_id=uid)
+                except Exception:
+                    ans = await ask_gemini(clean_txt, user_id=uid)
+                await safe_reply_human_streamed(event, ans)
                 await asyncio.to_thread(save_communication, sender.username if sender else None, clean_txt)
         except Exception as ex: await event.reply(f"Ошибка: {ex}")
