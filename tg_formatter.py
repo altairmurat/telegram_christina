@@ -195,87 +195,97 @@ async def safe_reply(event, text: str, **kwargs):
             last_msg = await event.reply(clean, parse_mode=None, **kwargs)
     return last_msg
 
-def split_into_human_chunks(text: str, max_chars: int = 700, max_chunks: int = 4) -> list[str]:
+def split_into_human_chunks(text: str, max_chunks: int = 5) -> list[str]:
     """
     Разбивает ответ ассистента на естественные реплики, как пишет живой человек:
     - Защищает блоки <pre>...</pre>, <code>...</code> и <blockquote>...</blockquote> от разрыва.
-    - Делит текст по абзацам и смысловым блокам (вводная мысль, вариант 1, вариант 2, завершающий вопрос).
-    - Не отрывает короткие заголовки (например <b>Вариант 1:</b>) от следующей за ними цитаты или текста.
-    - Ограничивает количество сообщений до max_chunks во избежание спама.
+    - Делит текст по абзацам (\n\n) — каждый отдельный абзац/мысль становится отдельным сообщением.
+    - Длинные абзацы без кода (> 380 символов) аккуратно делит по границам предложений.
+    - Не отрывает короткие заголовки/лид-ины (например <b>Вариант 1:</b>, «Вот пример:») от следующего за ними контента.
+    - Ограничивает суммарное число реплик до max_chunks (по умолчанию 5) во избежание спама, склеивая самые короткие соседние реплики.
     """
     text = (text or "").strip()
     if not text:
         return []
 
-    # Защищаем парные HTML блоки: pre, blockquote
+    # 1. Защищаем парные HTML блоки: pre, blockquote, а также ```markdown```
     protected = []
     def save_block(m):
         idx = len(protected)
         protected.append(m.group(0))
         return f"___HTML_PROT_{idx}___"
 
-    pat = re.compile(r"(<pre\b[^>]*>[\s\S]*?</pre>|<blockquote\b[^>]*>[\s\S]*?</blockquote>)", re.IGNORECASE)
+    pat = re.compile(r"(<pre\b[^>]*>[\s\S]*?</pre>|<blockquote\b[^>]*>[\s\S]*?</blockquote>|```[\s\S]*?```)", re.IGNORECASE)
     masked = pat.sub(save_block, text)
 
     raw_paras = [p.strip() for p in masked.split("\n\n") if p.strip()]
+    if not raw_paras:
+        return [text]
 
+    # 2. Если отдельный абзац слишком длинный (> 380 символов), делим его по границам предложений
+    expanded_paras = []
+    for p in raw_paras:
+        if len(p) > 380 and "___HTML_PROT_" not in p and not re.search(r"^\s*[-*•\d]\.?\s", p, re.M):
+            sentences = re.split(r"(?<=[.!?])\s+(?=[А-ЯЁA-Z])", p)
+            if len(sentences) > 1:
+                cur_buf = []
+                cur_len = 0
+                for s in sentences:
+                    if cur_len + len(s) > 280 and cur_buf:
+                        expanded_paras.append(" ".join(cur_buf))
+                        cur_buf = [s]
+                        cur_len = len(s)
+                    else:
+                        cur_buf.append(s)
+                        cur_len += len(s) + 1
+                if cur_buf:
+                    expanded_paras.append(" ".join(cur_buf))
+                continue
+        expanded_paras.append(p)
+
+    def is_lead_in(p_str: str) -> bool:
+        clean = re.sub(r"<[^>]+>", "", p_str).strip()
+        # Заголовок или короткая вводка до 90 символов
+        if len(clean) <= 90:
+            if clean.endswith(":"):
+                return True
+            if re.match(r"^(вариант\s+\d+|шаг\s+\d+|способ\s+\d+|пример\s*\d*|\d+[\.\)])", clean, re.I):
+                return True
+            if (p_str.startswith("<b>") and p_str.endswith("</b>")) or (p_str.startswith("**") and p_str.endswith("**")):
+                return True
+        return False
+
+    # 3. Объединяем короткие заголовки с их следующим содержимым
+    grouped = []
+    i = 0
+    while i < len(expanded_paras):
+        cur = expanded_paras[i]
+        if is_lead_in(cur) and i + 1 < len(expanded_paras):
+            grouped.append(cur + "\n" + expanded_paras[i+1])
+            i += 2
+        else:
+            grouped.append(cur)
+            i += 1
+
+    # 4. Если сообщений больше max_chunks — склеиваем наименьшие соседние части
+    while len(grouped) > max_chunks:
+        best_idx = 0
+        best_len = len(grouped[0]) + len(grouped[1])
+        for k in range(1, len(grouped) - 1):
+            combo = len(grouped[k]) + len(grouped[k+1])
+            if combo < best_len:
+                best_len = combo
+                best_idx = k
+        grouped[best_idx] = grouped[best_idx] + "\n\n" + grouped[best_idx + 1]
+        grouped.pop(best_idx + 1)
+
+    # 5. Восстанавливаем защищённые блоки
     def restore_block(s):
         for idx, block in enumerate(protected):
             s = s.replace(f"___HTML_PROT_{idx}___", block)
         return s
 
-    paras = [restore_block(p) for p in raw_paras]
-    if len(paras) <= 1:
-        return [text]
-
-    chunks = []
-    current_chunk = []
-    current_len = 0
-
-    for p in paras:
-        p_len = len(p)
-        has_heavy_block = any(tag in p for tag in ("<blockquote", "<pre", "```"))
-        prev_has_heavy_block = bool(current_chunk and any(tag in current_chunk[-1] for tag in ("<blockquote", "<pre", "```")))
-        is_short_lead_in = (p_len < 120 and (p.endswith(":</b>") or p.endswith(":") or p.startswith("<b>") or p.startswith("**")))
-
-        if not current_chunk:
-            current_chunk.append(p)
-            current_len = p_len
-            continue
-
-        # Условие разбиения на отдельное сообщение:
-        # - Накопился достаточный объём (> max_chars) и это не заголовок
-        # - Либо в текущем абзаце тяжёлый блок (цитата/код), а в текущем уже есть вводная мысль
-        # - Либо предыдущий абзац сам был тяжёлым блоком
-        should_split = (
-            (current_len + p_len > max_chars and not is_short_lead_in)
-            or (has_heavy_block and current_len > 120 and not current_chunk[-1].endswith(":</b>") and not current_chunk[-1].endswith(":"))
-            or prev_has_heavy_block
-        )
-
-        if should_split:
-            chunks.append("\n\n".join(current_chunk))
-            current_chunk = [p]
-            current_len = p_len
-        else:
-            current_chunk.append(p)
-            current_len += p_len + 2
-
-    if current_chunk:
-        chunks.append("\n\n".join(current_chunk))
-
-    while len(chunks) > max_chunks:
-        min_idx = 0
-        min_sum = len(chunks[0]) + len(chunks[1])
-        for k in range(1, len(chunks) - 1):
-            s = len(chunks[k]) + len(chunks[k+1])
-            if s < min_sum:
-                min_sum = s
-                min_idx = k
-        chunks[min_idx] = chunks[min_idx] + "\n\n" + chunks[min_idx + 1]
-        chunks.pop(min_idx + 1)
-
-    return chunks
+    return [restore_block(c) for c in grouped]
 
 
 async def simulate_typing(client, chat_id: int, duration: float):
@@ -290,12 +300,12 @@ async def simulate_typing(client, chat_id: int, duration: float):
         await asyncio.sleep(duration)
 
 
-async def safe_reply_human_streamed(event, text: str, max_chunks: int = 4, **kwargs):
+async def safe_reply_human_streamed(event, text: str, max_chunks: int = 5, **kwargs):
     """
     Отправляет ответ пользователю несколькими естественными репликами, как реальный человек:
     1. Первое сообщение отправляется реплаем на вопрос пользователя.
     2. Перед отправкой каждого последующего сообщения в чате отображается статус 'печатает...' (typing).
-    3. Последующие сообщения отправляются как продолжение диалога (без дублирования плашки реплая в ЛС).
+    3. В ЛС последующие сообщения идут без повторения цитаты, а в группах/топиках сохраняется reply_to для маршрутизации.
     """
     if not text or not text.strip():
         return None
@@ -313,24 +323,19 @@ async def safe_reply_human_streamed(event, text: str, max_chunks: int = 4, **kwa
 
     # 2. Если чанков несколько — отправляем последующие с естественной задержкой и статусом "печатает..."
     for chunk in chunks[1:]:
-        # Имитируем реальную скорость набора текста человеком (~20-30 символов в сек)
-        typing_delay = min(max(len(chunk) * 0.016, 1.2), 3.2)
+        # Имитируем реальную скорость набора текста человеком (~25-35 символов в сек, от 1.0 до 2.6 сек)
+        typing_delay = min(max(len(chunk) * 0.012, 1.0), 2.6)
         await simulate_typing(client, chat_id, typing_delay)
 
         fmt = format_tg_html(chunk)
-        try:
-            if is_private:
+        if is_private:
+            try:
                 last_msg = await client.send_message(chat_id, fmt, parse_mode="html", **kwargs)
-            else:
-                reply_to = getattr(event, "id", None)
-                last_msg = await client.send_message(chat_id, fmt, reply_to=reply_to, parse_mode="html", **kwargs)
-        except Exception:
-            clean = re.sub(r"<[^>]+>", "", fmt)
-            if is_private:
+            except Exception:
+                clean = re.sub(r"<[^>]+>", "", fmt)
                 last_msg = await client.send_message(chat_id, clean, parse_mode=None, **kwargs)
-            else:
-                reply_to = getattr(event, "id", None)
-                last_msg = await client.send_message(chat_id, clean, reply_to=reply_to, parse_mode=None, **kwargs)
+        else:
+            last_msg = await safe_reply(event, chunk, **kwargs)
 
     return last_msg
 

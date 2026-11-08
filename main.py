@@ -247,10 +247,11 @@ def clean_email_address(raw: str | None) -> str:
     return m.group(0).rstrip(".,;:!?'\"")
 
 def create_gmail_draft(gmail, to: str, subject: str, body: str) -> str:
-    msg = EmailMessage()
     clean_to = clean_email_address(to)
-    if clean_to:
-        msg['To'] = clean_to
+    if not clean_to:
+        raise ValueError(f"Не указан корректный адрес получателя (email): '{to}'")
+    msg = EmailMessage()
+    msg['To'] = clean_to
     msg['Subject'] = (subject or "Без темы").strip()
     msg.set_content(body or "", charset='utf-8')
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -511,7 +512,7 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
 
         ctx = format_messages_for_prompt(msgs)
         ans = await answer_with_group_context(text, ctx, user_id=user_id)
-        await safe_reply(event, ans)
+        await safe_reply_human_streamed(event, ans)
         return True
 
     if intent.is_pdf:
@@ -1333,7 +1334,11 @@ async def necessary_task_handler(event):
         if clean_em:
             gmail = await asyncio.to_thread(get_gmail_client_for, uid)
             user_states.pop(uid, None)
-            if gmail: await send_draft_to_telegram(event, gmail, uid, clean_em, name, topic, s_name)
+            if gmail:
+                try:
+                    await send_draft_to_telegram(event, gmail, uid, clean_em, name, topic, s_name)
+                except Exception as ex:
+                    await safe_reply(event, f"❌ Ошибка при создании черновика: {ex}")
             else: await event.reply(f"Сессия не найдена. Авторизуйся: {build_auth_url(uid)}")
         else: await event.reply("Это не похоже на email. Попробуй ещё раз или введи /cancel")
         return
