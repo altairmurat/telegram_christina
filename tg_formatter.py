@@ -12,7 +12,7 @@ tg_formatter.py
 - Экранирование сырых символов (&, <, >), чтобы Telegram не падал с ошибками парсинга.
 """
 
-import re
+import asyncio, re
 from html import escape
 from telethon.extensions import html as telethon_html
 
@@ -197,37 +197,28 @@ async def safe_reply(event, text: str, **kwargs):
 
 async def safe_reply_streamed(event, text: str, delay: float = 1.5, **kwargs):
     """
-    Отправляет длинный ответ на сообщение кусочками (по предложениям/абзацам) 
-    с задержкой в 1-2 секунды, чтобы бот выглядел как живой человек.
+    Отправляет ответ на сообщение.
+    Если текст содержит цельный структурированный контент (HTML-теги, списки, цитаты, код)
+    или длиннее 800 символов, отправляет его целиком через safe_reply во избежание разрыва форматирования.
+    Для коротких разговорных диалогов может отправлять крупные смысловые части с естественной паузой.
     """
     if not text:
         return None
-    # Разбиваем текст на абзацы и предложения (сохраняя знаки препинания)
-    raw_parts = re.split(r'(?<=[.!?\n])\s+', text.strip())
-    sentences = [p.strip() for p in raw_parts if p.strip()]
-    if not sentences:
+
+    # Если в тексте есть разметка (теги, цитаты, код, списки) или текст длинный — отправляем целиком
+    if any(tag in text for tag in ("<blockquote", "<pre", "<code", "<b>", "<i>", "•", "\n1.", "\n-", "> ")) or len(text) > 800:
         return await safe_reply(event, text, **kwargs)
 
-    # Собираем предложения обратно в небольшие осмысленные кусочки (до 3-4 предложений или 300 символов на пачку)
-    chunks = []
-    current_chunk = []
-    current_len = 0
-    for s in sentences:
-        if current_len + len(s) > 350 and current_chunk:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [s]
-            current_len = len(s)
-        else:
-            current_chunk.append(s)
-            current_len += len(s) + 1
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
+    # Разбиваем короткий разговорный текст только по крупным двойным переводам строк (абзацам)
+    paragraphs = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
+    if len(paragraphs) <= 1:
+        return await safe_reply(event, text, **kwargs)
 
     last_msg = None
-    for idx, chunk in enumerate(chunks):
+    for idx, p in enumerate(paragraphs):
         if idx > 0:
             await asyncio.sleep(delay)
-        last_msg = await safe_reply(event, chunk, **kwargs)
+        last_msg = await safe_reply(event, p, **kwargs)
     return last_msg
 
 

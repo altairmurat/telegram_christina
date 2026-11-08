@@ -1454,7 +1454,7 @@ async def necessary_task_handler(event):
             if txt:
                 if not await try_handle_email_intent(event, uid, txt):
                     ans = await ask_gemini(txt, user_id=uid)
-                    await safe_reply_streamed(event, ans)
+                    await safe_reply(event, ans)
                     await asyncio.to_thread(save_communication, sender.username if sender else None, txt)
             else: await event.reply("Не удалось распознать речь.")
         except Exception as ex: await event.reply(f"Ошибка аудио: {ex}")
@@ -1525,6 +1525,6 @@ async def necessary_task_handler(event):
         try:
             if not await try_handle_email_intent(event, uid, clean_txt):
                 ans = await ask_gemini(clean_txt, user_id=uid)
-                await safe_reply_streamed(event, ans)
+                await safe_reply(event, ans)
                 await asyncio.to_thread(save_communication, sender.username if sender else None, clean_txt)
         except Exception as ex: await event.reply(f"Ошибка: {ex}")
