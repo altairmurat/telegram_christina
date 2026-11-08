@@ -41,7 +41,7 @@ from timezone_helper import (
     sync_google_calendar_timezone, resolve_timezone_name
 )
 from tg_formatter import safe_reply, safe_reply_human_streamed, safe_reply_streamed, safe_edit_message, safe_send_message, format_tg_html
-from tts_helper import send_voice_if_long
+from tts_helper import send_response_smart
 from fal_video import (
     is_owner, is_video_admin, add_video_admins, remove_video_admins,
     list_video_admins, check_video_quota, record_video_generation,
@@ -513,8 +513,7 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
 
         ctx = format_messages_for_prompt(msgs)
         ans = await answer_with_group_context(text, ctx, user_id=user_id)
-        await safe_reply_human_streamed(event, ans)
-        await send_voice_if_long(client, event, ans)
+        await send_response_smart(client, event, ans)
         return True
 
     if intent.is_pdf:
@@ -1465,8 +1464,7 @@ async def necessary_task_handler(event):
                             ans = await ask_gemini(txt, user_id=uid)
                     except Exception:
                         ans = await ask_gemini(txt, user_id=uid)
-                    await safe_reply_human_streamed(event, ans)
-                    await send_voice_if_long(client, event, ans)
+                    await send_response_smart(client, event, ans)
                     await asyncio.to_thread(save_communication, sender.username if sender else None, txt)
             else: await event.reply("Не удалось распознать речь.")
         except Exception as ex: await event.reply(f"Ошибка аудио: {ex}")
@@ -1541,7 +1539,6 @@ async def necessary_task_handler(event):
                         ans = await ask_gemini(clean_txt, user_id=uid)
                 except Exception:
                     ans = await ask_gemini(clean_txt, user_id=uid)
-                await safe_reply_human_streamed(event, ans)
-                await send_voice_if_long(client, event, ans)
+                await send_response_smart(client, event, ans)
                 await asyncio.to_thread(save_communication, sender.username if sender else None, clean_txt)
         except Exception as ex: await event.reply(f"Ошибка: {ex}")
