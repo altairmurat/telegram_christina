@@ -26,6 +26,14 @@ _TAG_TOKEN_RE = re.compile(
     re.IGNORECASE
 )
 
+_AMP_ESCAPE_RE = re.compile(r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)")
+
+def _escape_href_amps(match):
+    quote = match.group(1)
+    val = match.group(2)
+    val_fixed = _AMP_ESCAPE_RE.sub("&amp;", val)
+    return "href=" + quote + val_fixed + quote
+
 
 def _convert_markdown_to_html(text: str) -> str:
     if not text:
@@ -77,8 +85,14 @@ def _convert_markdown_to_html(text: str) -> str:
     # 5. Конвертируем зачёркнутый: ~~текст~~
     s = re.sub(r"~~([^~]+)~~", r"<s>\1</s>", s)
 
-    # 6. Конвертируем ссылки [текст](url)
-    s = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', s)
+    # 6. Конвертируем ссылки [текст](url) с обязательным экранированием & в &amp; в href
+    def _replace_md_link(m):
+        link_text = m.group(1)
+        raw_url = m.group(2)
+        esc_url = _AMP_ESCAPE_RE.sub("&amp;", raw_url)
+        return f'<a href="{esc_url}">{link_text}</a>'
+
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _replace_md_link, s)
 
     # 7. Конвертируем цитаты > текст в <blockquote>
     lines = []
@@ -131,8 +145,12 @@ def format_tg_html(text: str) -> str:
             raw_chunk = converted[last_idx:start]
             esc_chunk = raw_chunk.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             parts.append(esc_chunk)
-        # Сам тег оставляем как есть
-        parts.append(match.group(0))
+        # Сам тег: если это <a href="...">, экранируем сырые & внутри href в &amp;,
+        # чтобы парсер Telethon/HTMLParser не превращал &curren в знак валюты ¤
+        tag_str = match.group(0)
+        if tag_str.lower().startswith("<a "):
+            tag_str = re.sub(r'href=(["\'])(.*?)\1', _escape_href_amps, tag_str, flags=re.I)
+        parts.append(tag_str)
         last_idx = end
 
     if last_idx < len(converted):

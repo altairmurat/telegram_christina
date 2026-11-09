@@ -160,7 +160,7 @@ def fetch_detail(session: requests.Session, menu_key: str, board_id: str, post_i
         m = re.search(r"fnDownloadFile\(\s*['\"]?([^'\",)]+)['\"]?\s*,\s*['\"]?([^'\",)]+)['\"]?\s*\)", a.get("onclick", ""))
         if m: attachments.append({"conn_no": m.group(1), "seq_no": m.group(2), "label": a.get_text(strip=True)})
 
-    post_url = f"{url}?NOTIWR_NO={post_id}&currentPage=1&BOARD_ID={board_id}&SITE_KEY={SITE_KEY}&MENU_KEY={menu_key}&language={LANGUAGE}"
+    post_url = f"{url}?language={LANGUAGE}&NOTIWR_NO={post_id}&currentPage=1&BOARD_ID={board_id}&SITE_KEY={SITE_KEY}&MENU_KEY={menu_key}"
     return {"text": text, "links": links, "post_url": post_url, "attachments": attachments}
 
 def summarize_with_gemini(title: str, text: str, category: str) -> dict:
