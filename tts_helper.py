@@ -2,15 +2,16 @@
 tts_helper.py
 -------------
 Генерация естественных и живых голосовых сообщений (голосовых заметок) для Telegram
-с использованием сверхреалистичной нейросетевой модели Google Gemini (gemini-3.8-flash-tts)
-и кастомного голосового профиля 20-летней девушки ("пикми-подруга", мягкий, естественный разговорный девичий голос).
+с использованием сверхреалистичной нейросетевой модели Google Gemini 3.8 Flash TTS.
 
-- Первичный движок: Google Gemini 3.8 Flash TTS (Interactions API)
-  - Голосовой профиль: voice_ldsq01tgm8mp (Designed Voice: нежный, живой девичий тембр)
-  - Формат: конвертация WAV -> OGG Opus через soundfile для нативной поддержки в Telegram
-- Резервный движок: edge-tts (ru-RU-SvetlanaNeural) при отсутствии сети или квоты
-- Порог срабатывания: длинные ответы (>= 250 символов) озвучиваются голосовым сообщением,
-  а короткие отправляются текстом.
+- Первичный голос: Leda (встроенный студийный голос Google: молодая, милая 20-летняя девушка с естественной русской речью, быстрый отклик ~7 сек)
+- Поддержка кастомного голоса через env GEMINI_VOICE_ID (с автоматическим откатом на Leda при недоступности)
+- Конвертация: WAV -> OGG Opus через soundfile для нативной поддержки голосовых в Telegram
+- Резервный движок: edge-tts при отсутствии сети или квоты
+- Порог срабатывания:
+  * Длинные ответы (>= 130 символов)
+  * Запросы на рассказ / анекдот / голосовое (ключевые слова: анекдот, расскажи, голос, гс, скажи)
+  * Короткие реплики (< 130 символов) отправляются быстрым живым текстом.
 """
 
 import os
@@ -24,9 +25,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Кастомный созданный голосовой профиль в Google GenAI
-# (20-летняя русскоязычная девушка, мягкий, нежный, естественный девичий голос по образцу girlspeech)
-PRIMARY_GEMINI_VOICE_ID = os.getenv("GEMINI_VOICE_ID", "voice_6ojy57zf52yp")
+# Первичный студийный голос в Gemini 3.8 Flash TTS
+# Leda — официальный студийный голос Google ("Youthful", милая 20-летняя девушка с живым русским произношением)
+PRIMARY_GEMINI_VOICE = os.getenv("GEMINI_VOICE_NAME", "Leda")
 GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
 
 # Резервные настройки Edge-TTS
@@ -34,10 +35,13 @@ DEFAULT_EDGE_VOICE = "ru-RU-SvetlanaNeural"
 DEFAULT_EDGE_PITCH = "+5Hz"
 DEFAULT_EDGE_RATE = "-2%"
 
-# Порог длины текста (в символах без тегов), при превышении которого ответ отправляется голосовым сообщением
-LONG_TEXT_VOICE_THRESHOLD = 250
-# Максимальная длина озвучиваемого текста (~1.5 минуты живой речи)
+# Порог длины текста (в символах без тегов) для автоматической озвучки
+LONG_TEXT_VOICE_THRESHOLD = 130
 MAX_VOICE_CHARS = 1200
+
+VOICE_INTENT_KEYWORDS = (
+    "анекдот", "голос", "голосовое", "гс", "расскажи", "озвучь", "скажи", "поболтай", "спой", "историю"
+)
 
 
 def clean_text_for_speech(text: str) -> str:
@@ -64,10 +68,19 @@ def clean_text_for_speech(text: str) -> str:
     return s
 
 
-def is_long_for_voice(text: str, threshold: int = LONG_TEXT_VOICE_THRESHOLD) -> bool:
-    """Проверяет, является ли ответ длинным и требующим отправки голосовым сообщением."""
+def is_long_for_voice(text: str, user_text: str = "", threshold: int = LONG_TEXT_VOICE_THRESHOLD) -> bool:
+    """Проверяет, требуется ли отправка ответа голосовым сообщением."""
     clean = clean_text_for_speech(text)
-    return len(clean) >= threshold
+    if not clean or len(clean) < 25:
+        return False
+    # Длинный ответ
+    if len(clean) >= threshold:
+        return True
+    # Явный запрос пользователя на рассказ / анекдот / голос
+    u_low = (user_text or "").lower()
+    if any(k in u_low for k in VOICE_INTENT_KEYWORDS) and len(clean) >= 40:
+        return True
+    return False
 
 
 def _wav_to_ogg_opus(wav_bytes: bytes) -> bytes:
@@ -78,50 +91,50 @@ def _wav_to_ogg_opus(wav_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-async def generate_gemini_voice_bytes(cleaned_text: str) -> bytes | None:
-    """
-    Генерирует живой голос 20-летней девушки через Google Gemini 3.8 Flash TTS
-    с кастомным голосовым профилем и конвертирует в OGG Opus для Telegram.
-    """
+def _sync_call_gemini_tts(cleaned_text: str, voice_name: str) -> bytes | None:
+    """Синхронный вызов Gemini Interactions API в отдельном потоке (без зависаний SSL asyncio)."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
+    from google import genai
+    client = genai.Client(api_key=api_key)
 
-    try:
-        from google import genai
-        client = genai.Client(api_key=api_key)
-
-        res = await client.aio.interactions.create(
-            model=GEMINI_TTS_MODEL,
-            input=[{
-                "type": "user_input",
-                "content": [{
-                    "type": "text",
-                    "text": cleaned_text,
-                    "annotations": [{
-                        "type": "speech_metadata",
-                        "style": "casual, soft, natural conversational, cute and lively 20yo girl voice note to a friend",
-                    }],
+    res = client.interactions.create(
+        model=GEMINI_TTS_MODEL,
+        input=[{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": cleaned_text,
+                "annotations": [{
+                    "type": "speech_metadata",
+                    "style": "sweet, soft, youthful, playful and casual 20yo Russian girl voice note to a friend",
                 }],
             }],
-            response_format={"type": "audio"},
-            generation_config={
-                "speech_config": [
-                    {"voice": PRIMARY_GEMINI_VOICE_ID}
-                ]
-            }
-        )
+        }],
+        response_format={"type": "audio"},
+        generation_config={
+            "speech_config": [
+                {"voice": voice_name}
+            ]
+        }
+    )
 
-        if res.output_audio and res.output_audio.data:
-            wav_bytes = base64.b64decode(res.output_audio.data)
-            ogg_bytes = await asyncio.to_thread(_wav_to_ogg_opus, wav_bytes)
-            return ogg_bytes
-        else:
-            print("[TTS] Gemini TTS вернул пустой audio output, переключение на резервный...")
-            return None
+    if res.output_audio and res.output_audio.data:
+        wav_bytes = base64.b64decode(res.output_audio.data)
+        return _wav_to_ogg_opus(wav_bytes)
+    return None
+
+
+async def generate_gemini_voice_bytes(cleaned_text: str) -> bytes | None:
+    """Генерирует живой голос 20-летней девушки через Google Gemini 3.8 Flash TTS со студийным голосом Leda."""
+    try:
+        ogg_data = await asyncio.to_thread(_sync_call_gemini_tts, cleaned_text, PRIMARY_GEMINI_VOICE)
+        if ogg_data:
+            return ogg_data
     except Exception as e:
-        print(f"[TTS] Ошибка Gemini TTS ({e}), переключение на резервный синтезатор...")
-        return None
+        print(f"[TTS] Ошибка Gemini TTS ({e}), откат на резервный синтезатор...")
+    return None
 
 
 async def generate_edge_voice_bytes(
@@ -147,14 +160,13 @@ async def generate_voice_bytes(text: str) -> bytes | None:
     """
     Основная точка входа генерации аудио:
     1. Очищает текст и обрезает слишком длинные монологи.
-    2. Пытается сгенерировать ультра-естественный голос 20-летней девушки через Gemini 3.8 Flash TTS.
+    2. Пытается сгенерировать ультра-естественный голос 20-летней девушки через Gemini 3.8 Flash TTS (Leda / Custom).
     3. При сетевой ошибке делает откат на резервный Edge TTS.
     """
     cleaned = clean_text_for_speech(text)
     if not cleaned or len(cleaned) < 10:
         return None
 
-    # Если текст очень длинный, аккуратно обрезаем по последнему завершённому предложению
     if len(cleaned) > MAX_VOICE_CHARS:
         cut = cleaned[:MAX_VOICE_CHARS]
         last_punct = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
@@ -173,13 +185,13 @@ async def generate_voice_bytes(text: str) -> bytes | None:
     return await generate_edge_voice_bytes(cleaned)
 
 
-async def send_response_smart(client, event, ans: str, threshold: int = LONG_TEXT_VOICE_THRESHOLD):
+async def send_response_smart(client, event, ans: str, threshold: int = LONG_TEXT_VOICE_THRESHOLD, user_text: str = ""):
     """
     Умная отправка ответа пользователю:
-    - Если ответ короткий (< 250 символов) -> отправляет компактный текст в виде аккуратных реплик.
-    - Если ответ длинный (>= 250 символов) -> отправляет ГОЛОСОВОЕ СООБЩЕНИЕ (ГС) живым голосом 20-летней девушки,
+    - Если ответ короткий (< 130 символов) -> отправляет компактный текст в виде аккуратных реплик.
+    - Если ответ длинный (>= 130 символов) или запрос на голос/анекдот -> отправляет ГОЛОСОВОЕ СООБЩЕНИЕ (ГС) живым девичьим голосом,
       НЕ отправляя перед ним простыню текста.
-    - Если в длинном ответе был код (```...```) или важные ссылки, они аккуратно отправляются текстом под ГС.
+    - Если в ответе был код (```...```), он аккуратно отправляется текстом под ГС.
     - При любой сетевой ошибке генерации речи мягко откатывается на текстовую отправку.
     """
     if not ans or not ans.strip():
@@ -189,12 +201,14 @@ async def send_response_smart(client, event, ans: str, threshold: int = LONG_TEX
     is_private = getattr(event, "is_private", True)
     reply_to = None if is_private else getattr(event, "id", None)
 
-    if is_long_for_voice(ans, threshold=threshold):
-        # Ищем блоки кода в ответе, чтобы продублировать их текстом ниже голосового сообщения
+    # Извлекаем текст входящего сообщения, если не передан явно
+    if not user_text:
+        user_text = getattr(event, "raw_text", "") or getattr(event, "text", "")
+
+    if is_long_for_voice(ans, user_text=user_text, threshold=threshold):
         code_blocks = re.findall(r"(```[\s\S]*?```|<pre\b[^>]*>[\s\S]*?</pre>)", ans)
         voice_sent = False
         try:
-            # Показываем статус "записывает голосовое сообщение..." в процессе генерации
             try:
                 async with client.action(chat_id, "record-audio"):
                     voice_data = await generate_voice_bytes(ans)
@@ -213,7 +227,6 @@ async def send_response_smart(client, event, ans: str, threshold: int = LONG_TEX
                 )
                 voice_sent = True
 
-                # Если в ответе был код, отправляем его отдельным аккуратным сообщением под ГС
                 if code_blocks:
                     from tg_formatter import safe_reply
                     code_text = "\n\n".join(code_blocks)
@@ -225,6 +238,6 @@ async def send_response_smart(client, event, ans: str, threshold: int = LONG_TEX
         if voice_sent:
             return
 
-    # Короткий ответ или безопасный откат при ошибке TTS: отправляем естественными текстовыми сообщениями
+    # Текстовая отправка репликами
     from tg_formatter import safe_reply_human_streamed
     return await safe_reply_human_streamed(event, ans)
