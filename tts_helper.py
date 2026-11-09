@@ -25,8 +25,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Кастомный созданный голосовой профиль в Google GenAI
-# (20-летняя русскоязычная девушка, мягкий, нежный, естественный девичий голос без робот-эффекта)
-PRIMARY_GEMINI_VOICE_ID = os.getenv("GEMINI_VOICE_ID", "voice_ldsq01tgm8mp")
+# (20-летняя русскоязычная девушка, мягкий, нежный, естественный девичий голос по образцу girlspeech)
+PRIMARY_GEMINI_VOICE_ID = os.getenv("GEMINI_VOICE_ID", "voice_6ojy57zf52yp")
 GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
 
 # Резервные настройки Edge-TTS
