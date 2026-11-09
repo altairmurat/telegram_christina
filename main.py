@@ -939,6 +939,8 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 📌 **Команды:**
 • /help — список возможностей
+• /version — версия сборки и статус синтеза речи (TTS)
+• /testvoice — прислать тестовое голосовое сообщение от Кристины
 • /everytime — журнал постов с DGIST Everytime (с переводом слово в слово)
 • /etkeywords — ключевые слова для фильтрации Everytime
 • /connecteverytime — подключить DGIST Everytime
@@ -973,6 +975,72 @@ async def start_msg(e):
 async def help_msg(e):
     remember_group_topic(e)
     await e.reply(HELP_TEXT)
+
+@client.on(events.NewMessage(pattern=r'^/(version|diagnose|voiceinfo)(@\w+)?(\s|$)'))
+async def version_msg(e):
+    remember_group_topic(e)
+    msg = await e.reply("🔍 Проверяю версию сборки и состояние голосового движка...")
+    try:
+        from version import COMMIT_SHA, COMMIT_DATE, COMMIT_MESSAGE
+        v_info = f"<code>{COMMIT_SHA[:7]}</code> ({COMMIT_DATE})\n📝 <i>{COMMIT_MESSAGE}</i>"
+    except Exception:
+        v_info = "Локальная / неопределённая сборка"
+
+    from tts_helper import PRIMARY_GEMINI_VOICE, GEMINI_TTS_MODEL, _sync_call_gemini_tts
+    import time
+    t0 = time.time()
+    try:
+        sample = await asyncio.to_thread(_sync_call_gemini_tts, "Привет, это проверка звука!", PRIMARY_GEMINI_VOICE)
+        dur = round(time.time() - t0, 2)
+        if sample and len(sample) > 500:
+            tts_status = f"✅ <b>Работает отлично</b> ({len(sample)} байт, {dur} сек)\n🎙 Модель: <code>{GEMINI_TTS_MODEL}</code> | Голос: <b>{PRIMARY_GEMINI_VOICE}</b>"
+        else:
+            tts_status = "⚠️ Gemini TTS вернул пустой аудиопоток (откат на Edge TTS Svetlana)"
+    except Exception as ex:
+        tts_status = f"❌ <b>Ошибка Gemini TTS:</b> <code>{ex}</code>\n⚠️ Работает резервный голос Edge TTS (Svetlana)"
+
+    report = (
+        f"🤖 <b>Статус Кристины</b>\n\n"
+        f"📦 <b>Версия сборки:</b>\n{v_info}\n\n"
+        f"🗣 <b>Состояние TTS (Синтез речи):</b>\n{tts_status}\n\n"
+        f"💡 Напиши /testvoice, чтобы послушать живое голосовое сообщение от Кристины."
+    )
+    await msg.edit(report, parse_mode="html")
+
+@client.on(events.NewMessage(pattern=r'^/testvoice(@\w+)?(\s|$)'))
+async def testvoice_msg(e):
+    remember_group_topic(e)
+    msg = await e.reply("🎙 Генерирую тестовое голосовое сообщение...")
+    from tts_helper import generate_gemini_voice_bytes, generate_edge_voice_bytes, PRIMARY_GEMINI_VOICE
+    gemini_audio = await generate_gemini_voice_bytes("Привет! Это я, Кристина. Теперь я разговариваю естественным живым голосом без роботизированного тона!")
+    if gemini_audio:
+        buf = io.BytesIO(gemini_audio)
+        buf.name = "voice.ogg"
+        await client.send_file(
+            e.chat_id,
+            buf,
+            voice_note=True,
+            reply_to=e.id,
+            caption=f"✨ Голос сгенерирован через Google Gemini 3.8 Flash TTS (голос: {PRIMARY_GEMINI_VOICE})"
+        )
+        try: await msg.delete()
+        except Exception: pass
+    else:
+        edge_audio = await generate_edge_voice_bytes("Привет! Это резервный голос Edge TTS.")
+        if edge_audio:
+            buf = io.BytesIO(edge_audio)
+            buf.name = "voice.ogg"
+            await client.send_file(
+                e.chat_id,
+                buf,
+                voice_note=True,
+                reply_to=e.id,
+                caption="⚠️ Gemini TTS недоступен, использован резервный Edge TTS Svetlana"
+            )
+            try: await msg.delete()
+            except Exception: pass
+        else:
+            await msg.edit("❌ Не удалось сгенерировать аудио.")
 
 @client.on(events.NewMessage(pattern=r'^/topics(@\w+)?(\s|$)'))
 async def show_topics(e):
