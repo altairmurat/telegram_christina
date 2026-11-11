@@ -108,8 +108,9 @@ def _sync_call_gemini_tts(cleaned_text: str, voice_name: str) -> bytes | None:
                 "text": cleaned_text,
                 "annotations": [{
                     "type": "speech_metadata",
-                    "style": "sweet, soft, youthful, playful and casual 20yo Russian girl voice note to a friend",
+                    "style": "natural, calm, youthful, pleasant and casual 20yo Russian girl voice note to a friend",
                 }],
+
             }],
         }],
         response_format={"type": "audio"},
