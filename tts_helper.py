@@ -69,18 +69,16 @@ def clean_text_for_speech(text: str) -> str:
 
 
 def is_long_for_voice(text: str, user_text: str = "", threshold: int = LONG_TEXT_VOICE_THRESHOLD) -> bool:
-    """Проверяет, требуется ли отправка ответа голосовым сообщением."""
+    """Проверяет, требуется ли отправка ответа голосовым сообщением (ТОЛЬКО если пользователь прямо попросил об этом).
+    Теперь отправляем ГС строго при наличии ключевых слов типа 'по гс', 'голосовым', 'войс', 'озвучь', 'расскажи по гс' и т.п.
+    """
     clean = clean_text_for_speech(text)
-    if not clean or len(clean) < 25:
+    if not clean or len(clean) < 15:
         return False
-    # Длинный ответ
-    if len(clean) >= threshold:
-        return True
-    # Явный запрос пользователя на рассказ / анекдот / голос
     u_low = (user_text or "").lower()
-    if any(k in u_low for k in VOICE_INTENT_KEYWORDS) and len(clean) >= 40:
-        return True
-    return False
+    voice_triggers = ("по гс", "голосовое", "войс", "voice", "гс", "озвучь", "надиктони", "скажи голосом")
+    has_explicit_request = any(t in u_low for t in voice_triggers) or any(k in u_low for k in VOICE_INTENT_KEYWORDS)
+    return bool(has_explicit_request and len(clean) >= 15)
 
 
 def _wav_to_ogg_opus(wav_bytes: bytes) -> bytes:
