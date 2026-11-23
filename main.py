@@ -24,6 +24,10 @@ from dgist_bot_handlers import (
     register_dgist_handlers, handle_dgist_conversation_step,
     run_portal_check, remember_group_topic, is_active_group_topic
 )
+from event_registration import (
+    register_event_handlers, handle_event_reg_conversation_step,
+    scan_and_register_dinner_events, register_from_post_ref_or_url
+)
 from everytime_bot_handlers import (
     register_everytime_handlers, handle_everytime_conversation_step,
     run_everytime_command, handle_everytime_url_in_message
@@ -460,7 +464,22 @@ async def handle_video_generation(
 async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
     if await handle_everytime_url_in_message(event, text):
         return True
+    m_gf = re.search(r"https?://(?:docs\.google\.com/forms/[^\s<>\"')\]}]+|forms\.gle/[^\s<>\"')\]}]+)", text or "", re.I)
+    if m_gf:
+        await register_from_post_ref_or_url(client, event, user_id, user_states, form_url=m_gf.group(0).rstrip(".,;:!?"))
+        return True
     intent = await parse_user_intent(text, user_id=user_id)
+    if intent.is_event_register:
+        if intent.event_scan_dinner and not intent.event_form_url and not intent.event_post_ref:
+            await scan_and_register_dinner_events(client, event, user_id, user_states)
+        else:
+            await register_from_post_ref_or_url(
+                client, event, user_id, user_states,
+                post_ref=intent.event_post_ref or text,
+                form_url=intent.event_form_url,
+            )
+        return True
+
     if intent.is_video:
         sender = await event.get_sender()
         uname = getattr(sender, "username", None) if sender else None
@@ -714,8 +733,8 @@ async def on_callback(event):
     parts = data.split(":")
     action, arg1 = parts[0], parts[1] if len(parts) > 1 else ""
 
-    # Кнопки пагинации журналов DGIST и Everytime обрабатываются в своих модулях
-    if action in ("dgmag", "etmag"):
+    # Кнопки пагинации журналов DGIST, Everytime и автоподачи на лекции обрабатываются в своих модулях
+    if action in ("dgmag", "etmag", "evreg"):
         return
 
     # Выбор часового пояса
@@ -866,6 +885,7 @@ async def startup_event():
     except Exception as e: print(f"DB init error: {e}")
     await client.start(bot_token=BOT_TOKEN)
     register_dgist_handlers(client, user_states)
+    register_event_handlers(client, user_states)
     register_everytime_handlers(client, user_states)
     asyncio.create_task(run_reminder_worker(client))
     try:
@@ -874,6 +894,9 @@ async def startup_event():
             lang_code="",
             commands=[
                 types.BotCommand("help", "Все возможности и команды"),
+                types.BotCommand("dinner", "Найти лекции с бесплатным ужином и подать заявку"),
+                types.BotCommand("register", "Автозаполнение формы Google Forms или поста DGIST"),
+                types.BotCommand("myprofile", "Мои данные для автозаполнения форм"),
                 types.BotCommand("everytime", "Журнал постов DGIST Everytime с переводом"),
                 types.BotCommand("etkeywords", "Ключевые слова для фильтра Everytime"),
                 types.BotCommand("connecteverytime", "Подключить DGIST Everytime"),
@@ -939,6 +962,9 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 📌 **Команды:**
 • /help — список возможностей
+• /dinner — найти лекции с бесплатным ужином и подать заявку (Google Forms)
+• /register — заполнить любую форму Google Forms или пост DGIST (#номер или ссылка)
+• /myprofile — сохранённые личные данные для автозаполнения форм
 • /version — версия сборки и статус синтеза речи (TTS)
 • /testvoice — прислать тестовое голосовое сообщение от Кристины
 • /everytime — журнал постов с DGIST Everytime (с переводом слово в слово)
@@ -954,6 +980,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 • /cancel — отменить текущее действие
 
 ✨ **Возможности (просто напиши или скажи голосом):**
+• 🍽 **Автоподача на лекции с бесплатным ужином** — при проверке портала DGIST (или по команде /dinner / «запиши меня на пост #...») я сама нахожу Google Forms, заполняю твои данные, спрашиваю недостающие, присылаю предзаполненную ссылку на проверку и после твоего одобрения записываю тебя!
 • 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
 • 🇰🇷 **Парсер DGIST Everytime** — напиши *«чекни еверитайм»*, используй /everytime или скинь прямую ссылку `everytime.kr/393752/v/...`, и я выдам журнал постов по ключевым словам (`foreigner`, `외국인`, `201`, `기숙사`, `dormitory` и др.) с дословным переводом слово в слово и комментариями!
 • 🎬 **Генерация видео** — напиши *«Сгенерируй видео на тему...»* или отправь фото с подписью *«Сгенерируй видео на...»*, и я создам короткий видеоролик (доступно 1 видео в день).
@@ -1357,6 +1384,7 @@ async def necessary_task_handler(event):
 
     if await handle_dgist_conversation_step(event, uid, state, user_states): return
     if await handle_everytime_conversation_step(event, uid, state, user_states): return
+    if await handle_event_reg_conversation_step(client, event, uid, state, user_states): return
 
     if state == "antigravity_mode" and is_owner(uid):
         if event.message.voice:

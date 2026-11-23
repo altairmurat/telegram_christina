@@ -37,8 +37,22 @@ HEADERS = {
 class SessionExpiredError(Exception): pass
 
 class NoticeSummary(BaseModel):
-    important: bool = Field(description="True if notice contains deadlines, scholarships, rules, or required actions")
+    important: bool = Field(description="True if notice contains deadlines, scholarships, rules, free dinner lectures, or required actions")
     summary: str = Field(description="Concise 1-2 sentence Russian summary of the notice")
+    is_free_dinner_event: bool = Field(
+        default=False,
+        description=(
+            "True ONLY if this notice announces a lecture, seminar, talk, workshop, conference, or campus event "
+            "that provides FREE DINNER / evening meal (e.g., 'dinner', 'free dinner', 'supper', '저녁', '저녁 식사', "
+            "'저녁 도시락', '석식', happy hour with dinner, or an evening lecture >= 16:30 offering free meal/food/pizza). "
+            "False for cafeteria weekly menus, lunch-only events, scholarships, or general notices without free dinner."
+        ),
+    )
+    event_title: str = Field(default="", description="Concise title of the lecture/event if it is an event, else empty string")
+    event_datetime: str = Field(default="", description="Event date and time in Russian (e.g. '24 ноября 2026 (вт), 18:30'), else empty string")
+    event_venue: str = Field(default="", description="Event venue/room (e.g. 'DGIST E8-312' or 'E1 Convention Hall'), else empty string")
+    event_short_desc: str = Field(default="", description="Short 1-2 sentence Russian description of the event and what dinner/food is provided")
+    registration_url: str = Field(default="", description="Exact registration URL (especially Google Forms) if present in the post or links, else empty string")
 
 def build_user_paths(uid: int) -> dict:
     base = os.path.join(BASE_DIR, "user_data", str(uid))
@@ -140,13 +154,34 @@ def fetch_detail(session: requests.Session, menu_key: str, board_id: str, post_i
     soup = BeautifulSoup(resp.text, "html.parser")
     eng, kor, body = soup.select_one("tr#cntn_eng_view"), soup.select_one("tr#cntn_kor_view"), soup.select_one("td.boardViewBody")
 
-    target_node = (
-        eng if (eng and eng.get_text(strip=True))
-        else kor if (kor and kor.get_text(strip=True))
-        else body
-    )
-    links = _extract_links_and_enrich_html(target_node) if target_node else []
-    text = target_node.get_text("\n", strip=True) if target_node else ""
+    # Извлекаем ссылки сразу из ВСЕХ секций (eng, kor, body), чтобы не пропустить Google Forms в корейской вкладке
+    links = []
+    seen_link_urls = set()
+    for node in (eng, kor, body):
+        if not node:
+            continue
+        for lk in _extract_links_and_enrich_html(node):
+            u = lk.get("url", "")
+            if u and u not in seen_link_urls:
+                seen_link_urls.add(u)
+                links.append(lk)
+
+    eng_text = eng.get_text("\n", strip=True) if eng else ""
+    kor_text = kor.get_text("\n", strip=True) if kor else ""
+    body_text = body.get_text("\n", strip=True) if body else ""
+
+    if eng_text:
+        low_eng = eng_text.lower()
+        # Если английская вкладка короткая или отсылает к корейскому тексту, добавляем корейскую часть
+        if kor_text and (len(eng_text) < 220 or "refer to the korean" in low_eng or "refer to korean" in low_eng or "korean materials" in low_eng):
+            text = f"{eng_text}\n\n---\n{kor_text}"
+        else:
+            text = eng_text
+    elif kor_text:
+        text = kor_text
+    else:
+        text = body_text
+
     if not text:
         candidates = [el.get_text(" ", strip=True) for el in soup.select("td, div")]
         text = max(candidates, key=len, default="")
@@ -163,18 +198,48 @@ def fetch_detail(session: requests.Session, menu_key: str, board_id: str, post_i
     post_url = f"{url}?language={LANGUAGE}&NOTIWR_NO={post_id}&currentPage=1&BOARD_ID={board_id}&SITE_KEY={SITE_KEY}&MENU_KEY={menu_key}"
     return {"text": text, "links": links, "post_url": post_url, "attachments": attachments}
 
-def summarize_with_gemini(title: str, text: str, category: str) -> dict:
+def summarize_with_gemini(title: str, text: str, category: str, links: list[dict] | None = None) -> dict:
     preview = (" ".join((text or "").split()))[:300] or "Описание объявления недоступно."
-    if not gemini_client: return {"important": True, "summary": preview}
-    prompt = f"Раздел: {category}\nЗаголовок: {title}\nТекст:\n{text[:4000]}\n\nСделай краткое описание на русском языке (максимум 2 предложения) и определи important=true (дедлайн, стипендия, регистрация, важное изменение правил) или false."
+    default_res = {
+        "important": True,
+        "summary": preview,
+        "is_free_dinner_event": False,
+        "event_title": "",
+        "event_datetime": "",
+        "event_venue": "",
+        "event_short_desc": "",
+        "registration_url": "",
+    }
+    if not gemini_client:
+        return default_res
+    links_txt = "\n".join(f"- {lk.get('label', '')}: {lk.get('url', '')}" for lk in (links or []) if isinstance(lk, dict) and lk.get("url"))
+    prompt = (
+        f"Раздел: {category}\nЗаголовок: {title}\n"
+        f"Ссылки из поста:\n{links_txt or 'нет'}\n"
+        f"Текст:\n{text[:4500]}\n\n"
+        "Сделай краткое описание на русском языке (максимум 2 предложения), определи important=true "
+        "(дедлайн, стипендия, регистрация, лекция с бесплатным ужином, важное изменение правил) или false.\n"
+        "Также проверь, является ли это лекцией/семинаром/мероприятием, где предоставляют БЕСПЛАТНЫЙ УЖИН "
+        "(dinner, free dinner, 저녁, 저녁 식사, 저녁 도시락, 석식, happy hour с ужином и т.п.): "
+        "если да — поставь is_free_dinner_event=true и заполни event_title, event_datetime, event_venue, event_short_desc и registration_url."
+    )
     try:
-        cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=NoticeSummary, temperature=0.2)
+        cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=NoticeSummary, temperature=0.15)
         res = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=cfg)
         parsed = NoticeSummary.model_validate_json(res.text or "{}")
-        return {"important": parsed.important, "summary": parsed.summary or preview}
+        return {
+            "important": parsed.important or parsed.is_free_dinner_event,
+            "summary": parsed.summary or preview,
+            "is_free_dinner_event": bool(parsed.is_free_dinner_event),
+            "event_title": (parsed.event_title or "").strip(),
+            "event_datetime": (parsed.event_datetime or "").strip(),
+            "event_venue": (parsed.event_venue or "").strip(),
+            "event_short_desc": (parsed.event_short_desc or "").strip(),
+            "registration_url": (parsed.registration_url or "").strip(),
+        }
     except Exception as e:
         print(f"[GEMINI] Warning: {e}, using preview fallback")
-        return {"important": True, "summary": preview}
+        return default_res
 
 def run_once(
     cookie: str = "",
@@ -225,7 +290,7 @@ def run_once(
                         continue
                     try:
                         detail = fetch_detail(session, menu_key, board_id, p["post_id"])
-                        verdict = summarize_with_gemini(p["title"], detail["text"], cat_name)
+                        verdict = summarize_with_gemini(p["title"], detail["text"], cat_name, links=detail["links"])
                         processed_titles.add(t_key)
                         seeded_posts.append({
                             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -236,6 +301,12 @@ def run_once(
                             "author": p["author"],
                             "important": verdict["important"],
                             "summary": verdict["summary"],
+                            "is_free_dinner_event": verdict.get("is_free_dinner_event", False),
+                            "event_title": verdict.get("event_title", ""),
+                            "event_datetime": verdict.get("event_datetime", ""),
+                            "event_venue": verdict.get("event_venue", ""),
+                            "event_short_desc": verdict.get("event_short_desc", ""),
+                            "registration_url": verdict.get("registration_url", ""),
                             "full_text": detail["text"][:4500],
                             "links": detail["links"],
                             "post_url": detail["post_url"],
@@ -267,7 +338,7 @@ def run_once(
                 ex_ids.add(pid); continue
             time.sleep(REQUEST_DELAY_SEC)
 
-            verdict = summarize_with_gemini(p["title"], detail["text"], cat_name)
+            verdict = summarize_with_gemini(p["title"], detail["text"], cat_name, links=detail["links"])
             processed_titles.add(t_key)
             entry = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -278,6 +349,12 @@ def run_once(
                 "author": p["author"],
                 "important": verdict["important"],
                 "summary": verdict["summary"],
+                "is_free_dinner_event": verdict.get("is_free_dinner_event", False),
+                "event_title": verdict.get("event_title", ""),
+                "event_datetime": verdict.get("event_datetime", ""),
+                "event_venue": verdict.get("event_venue", ""),
+                "event_short_desc": verdict.get("event_short_desc", ""),
+                "registration_url": verdict.get("registration_url", ""),
                 "full_text": detail["text"][:4500],
                 "links": detail["links"],
                 "post_url": detail["post_url"],

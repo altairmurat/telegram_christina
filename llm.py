@@ -157,6 +157,7 @@ class UserIntent(BaseModel):
         default="chat",
         description=(
             "'video' ONLY if user explicitly asks to generate/create/make a video or animate a photo; "
+            "'event_register' if user asks to register/apply for a lecture/seminar/event, fill a Google Form, or find/check lectures with free dinner (e.g. 'запиши меня на пост #24', 'подай заявку на лекцию', 'найди лекции с бесплатным ужином', 'заполни эту гугл форму https://...'); "
             "'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; "
             "'email' ONLY if user explicitly asks to write/send/compose an email to someone; "
             "'pdf' ONLY if user explicitly asks to generate/create/make a PDF file or document; "
@@ -169,6 +170,10 @@ class UserIntent(BaseModel):
     )
     is_video: bool = Field(default=False, description="True if intent == 'video' or user asks to generate/make a video or animate an image")
     video_prompt_en: str = Field(default="", description="Detailed visual prompt in English for generating the video (translate user's video idea into vivid English visual description)")
+    is_event_register: bool = Field(default=False, description="True if intent == 'event_register'")
+    event_scan_dinner: bool = Field(default=False, description="True if user asks to find/scan for lectures/events with free dinner on the portal")
+    event_post_ref: str = Field(default="", description="Post number (e.g. '#24') or event title keyword if user asks to register for a specific post/lecture")
+    event_form_url: str = Field(default="", description="Exact Google Forms or registration URL if user pasted one in the message")
     is_email: bool = Field(default=False, description="True if intent == 'email'")
     is_pdf: bool = Field(default=False, description="True if intent == 'pdf'")
     is_portal: bool = Field(default=False, description="True if intent == 'portal'")
@@ -207,7 +212,7 @@ class EmailDraft(BaseModel):
 from timezone_helper import get_user_now
 
 async def parse_user_intent(text: str, user_id: int | None = None) -> UserIntent:
-    """Определяет намерение пользователя (video / calendar / email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
+    """Определяет намерение пользователя (video / event_register / calendar / email / pdf / portal / group_query / обычный чат) через структурированный вывод Gemini."""
     now_dt, tz_name, tz_offset = get_user_now(user_id)
     now_str = now_dt.strftime(f"%Y-%m-%dT%H:%M:%S{tz_offset} (%A)")
     prompt = (
@@ -220,6 +225,7 @@ async def parse_user_intent(text: str, user_id: int | None = None) -> UserIntent
     try:
         data = UserIntent.model_validate_json(res.text or "{}")
         if data.intent == "video": data.is_video = True
+        elif data.intent == "event_register": data.is_event_register = True
         elif data.intent == "email": data.is_email = True
         elif data.intent == "pdf": data.is_pdf = True
         elif data.intent == "portal": data.is_portal = True

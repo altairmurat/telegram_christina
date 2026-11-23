@@ -17,6 +17,8 @@ def is_owner(user_id: int | None) -> bool:
 _active_portal_checks = set()
 AUTO_CHECK_INTERVAL_SEC = 33 * 60 * 60
 _auto_monitor_task = None
+_client_ref = None
+_user_states_ref: dict = {}
 GROUP_TARGET_FILE = os.path.join("user_data", "group_target.json")
 POSTS_PER_PAGE = 3
 portal_magazines: dict[str, dict] = {}
@@ -37,6 +39,8 @@ def create_portal_magazine(uid: int, posts: list[dict], header: str) -> str:
 
 
 def format_portal_magazine_page(mag: dict, page: int) -> tuple[str, list | None]:
+    from google_forms_auto import extract_registration_urls_from_post
+
     posts = mag.get("posts") or []
     header = mag.get("header") or "🔔 **Журнал объявлений DGIST:**"
     mag_id = mag.get("mag_id", "default")
@@ -49,12 +53,14 @@ def format_portal_magazine_page(mag: dict, page: int) -> tuple[str, list | None]
     slice_posts = posts[start_idx : start_idx + POSTS_PER_PAGE]
 
     lines = [f"{header}\n📖 **Страница {page + 1} из {total_pages}** (всего: {len(posts)})\n"]
+    reg_btns = []
     for offset, p in enumerate(slice_posts):
         num = start_idx + offset + 1
-        em = "🔴" if p.get("important") else "📢"
+        em = "🍽" if p.get("is_free_dinner_event") else ("🔴" if p.get("important") else "📢")
         cat = p.get("category", "DGIST")
         title = p.get("title", "Без названия")
-        block = f"**#{num}** {em} [{cat}]\n**{title}**"
+        dinner_badge = " `[БЕСПЛАТНЫЙ УЖИН]`" if p.get("is_free_dinner_event") else ""
+        block = f"**#{num}** {em} [{cat}]{dinner_badge}\n**{title}**"
         if p.get("date"):
             block += f"\n📅 {p['date']}"
         summary = (p.get("summary") or "").strip()
@@ -64,26 +70,30 @@ def format_portal_magazine_page(mag: dict, page: int) -> tuple[str, list | None]
             block += f"\n{summary}"
         lines.append(block)
 
+        pid = str(p.get("post_id") or "")
+        if pid and extract_registration_urls_from_post(p):
+            btn_lbl = f"🍽 Записаться #{num}" if p.get("is_free_dinner_event") else f"📝 Записаться #{num}"
+            reg_btns.append(Button.inline(btn_lbl, data=f"evreg:postreg:{pid}".encode("utf-8")))
+
     lines.append(
-        "\n💡 _Ты можешь спросить меня про любую новость (например: «что значит новость #2?» или «скинь ссылку на регистрацию из новости про ...»)_"
+        "\n💡 _Ты можешь спросить про любую новость, нажать «Записаться» или написать «запиши меня на пост #...» / `/dinner`_"
     )
     text = "\n\n".join(lines)
     if len(text) > 4000:
         text = text[:3990] + "..."
 
-    if total_pages <= 1:
-        return text, None
-
-    prev_page = (page - 1) % total_pages
-    next_page = (page + 1) % total_pages
-    buttons = [
-        [
+    buttons = []
+    if reg_btns:
+        buttons.append(reg_btns)
+    if total_pages > 1:
+        prev_page = (page - 1) % total_pages
+        next_page = (page + 1) % total_pages
+        buttons.append([
             Button.inline("⬅️ Назад", data=f"dgmag:{mag_id}:{prev_page}".encode("utf-8")),
             Button.inline(f"📄 {page + 1}/{total_pages}", data=b"dgmag:noop"),
             Button.inline("Вперёд ➡️", data=f"dgmag:{mag_id}:{next_page}".encode("utf-8")),
-        ]
-    ]
-    return text, buttons
+        ])
+    return text, (buttons if buttons else None)
 
 def get_topic_id(event) -> int | None:
     r = getattr(event.message, "reply_to", None)
@@ -171,13 +181,22 @@ async def run_portal_check(e):
                 mag_id = create_portal_magazine(uid, posts_to_show, header)
                 text, buttons = format_portal_magazine_page(portal_magazines[mag_id], 0)
                 await status_msg.edit(text, buttons=buttons, link_preview=False)
+                if new_posts and _client_ref:
+                    from event_registration import process_free_dinner_posts_after_portal_check
+                    asyncio.create_task(
+                        process_free_dinner_posts_after_portal_check(
+                            _client_ref, uid, new_posts, _user_states_ref, notify_chat_id=e.chat_id
+                        )
+                    )
     except Exception as ex:
         await status_msg.edit(f"❌ Не удалось проверить портал: {ex}")
     finally:
         _active_portal_checks.discard(uid)
 
 def register_dgist_handlers(client, user_states: dict):
-    global _auto_monitor_task
+    global _auto_monitor_task, _client_ref, _user_states_ref
+    _client_ref = client
+    _user_states_ref = user_states
 
     @client.on(events.NewMessage(pattern=r'^/connectmyportal(@\w+)?(\s|$)'))
     async def connect_portal(e):
@@ -197,6 +216,11 @@ def register_dgist_handlers(client, user_states: dict):
     @client.on(events.NewMessage(pattern=r'^/cancel(@\w+)?(\s|$)'))
     async def cancel_flow(e):
         user_states.pop(e.sender_id, None)
+        try:
+            from event_registration import cancel_active_registration_for_user
+            await asyncio.to_thread(cancel_active_registration_for_user, e.sender_id)
+        except Exception:
+            pass
         await e.reply("Ок, отменил текущий диалог.")
 
     @client.on(events.NewMessage(pattern=r'^/checkportal(@\w+)?(\s|$)'))
@@ -334,6 +358,12 @@ async def _auto_monitor_loop(client):
                             text, buttons = format_portal_magazine_page(portal_magazines[mag_id], 0)
                             if is_owner(uid):
                                 await client.send_message(uid, text, buttons=buttons, link_preview=False)
+                                from event_registration import process_free_dinner_posts_after_portal_check
+                                asyncio.create_task(
+                                    process_free_dinner_posts_after_portal_check(
+                                        client, uid, posts, _user_states_ref, notify_chat_id=uid
+                                    )
+                                )
                 except Exception as ex:
                     print(f"[AUTO] Ошибка user={uid}: {ex}")
                 finally:

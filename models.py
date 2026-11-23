@@ -134,3 +134,37 @@ class UserSetting(Base):
     telegram_user_id = Column(BigInteger, unique=True, index=True)
     timezone = Column(String, default="Asia/Seoul", nullable=True)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id = Column(BigInteger, unique=True, index=True)
+    profile_json = Column(Text, nullable=True)  # JSON с личными данными для автозаполнения форм (имя, 학번, телефон, email, факультет и т.д.)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class EventRegistration(Base):
+    __tablename__ = "event_registrations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String, unique=True, index=True)
+    telegram_user_id = Column(BigInteger, index=True)
+    chat_id = Column(BigInteger, nullable=True)
+    post_id = Column(String, index=True, nullable=True)
+    post_url = Column(Text, nullable=True)
+    form_url = Column(Text)
+    prefilled_url = Column(Text, nullable=True)
+    event_title = Column(String, nullable=True)
+    event_description = Column(Text, nullable=True)
+    event_datetime = Column(String, nullable=True)
+    event_venue = Column(String, nullable=True)
+    form_schema_json = Column(Text, nullable=True)
+    filled_answers_json = Column(Text, nullable=True)
+    missing_fields_json = Column(Text, nullable=True)
+    status = Column(String, default="queued", index=True)  # queued | waiting_info | awaiting_approval | submitted | cancelled | failed
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
