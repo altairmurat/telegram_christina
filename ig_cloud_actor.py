@@ -21,11 +21,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 
-IG_APP_ID = "936619743392459"
+IG_APP_ID = "1217981644879628"
 CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
+    "Instagram 275.0.0.27.98 (iPhone14,5; iOS 16_6; en_US; en-US; "
+    "scale=3.00; 1170x2532; 458229237)"
 )
 
 
@@ -192,6 +193,10 @@ def resolve_ig_user_id_sync(
     """
     Возвращает `(numeric_user_id, error_reason)`.
     Если `known_user_id` уже известен — сразу возвращает его без лишнего запроса.
+    Использует `/api/v1/users/search/?q=` и `/api/v1/fbsearch/topsearch_flat/`, которые стабильно
+    работают с облачных IP (в отличие от `web_profile_info`, часто отдающего пустой HTTP 429).
+    Если аккаунт не найден ни в поиске, ни в OG-разметке страницы — возвращает `(None, "not_found")`
+    (аккаунт удалён, деактивирован или сменил ник со времён старой ZIP-выгрузки).
     """
     clean_known = str(known_user_id or "").strip()
     if clean_known and clean_known.isdigit():
@@ -201,46 +206,79 @@ def resolve_ig_user_id_sync(
     if not u:
         return None, "Пустой username"
 
+    u_low = u.lower()
     session.headers["Referer"] = f"https://www.instagram.com/{u}/"
 
-    # 1. Основной эндпоинт web_profile_info
+    # 1. Основной быстрый поиск `/api/v1/users/search/?q=...` (работает с X-IG-App-ID 1217981644879628 без 429)
+    search_succeeded = False
     try:
-        r = session.get(
-            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(u)}",
-            timeout=15,
+        r_s = session.get(
+            f"https://www.instagram.com/api/v1/users/search/?q={urllib.parse.quote(u)}",
+            timeout=14,
         )
-        if r.status_code == 404:
-            return None, "not_found"
-        low = (r.text or "").lower()
-        if "login_required" in low or "checkpoint_required" in low or "challenge_required" in low:
+        low_s = (r_s.text or "").lower()
+        if "login_required" in low_s or "checkpoint_required" in low_s or "challenge_required" in low_s:
             return None, "auth_error"
-        if r.status_code == 429 or "feedback_required" in low:
+        if r_s.status_code == 429 or "feedback_required" in low_s:
             return None, "rate_limit"
-        if r.status_code == 200:
-            data = r.json()
-            user_obj = (data.get("data") or {}).get("user") or {}
+        if r_s.status_code == 200:
+            search_succeeded = True
+            data_s = r_s.json()
+            for usr in data_s.get("users", []):
+                if isinstance(usr, dict) and str(usr.get("username", "")).lower() == u_low:
+                    pk = str(usr.get("pk") or usr.get("id") or "").strip()
+                    if pk.isdigit():
+                        return pk, None
+    except Exception:
+        pass
+
+    # 2. Резервный эндпоинт `/api/v1/fbsearch/topsearch_flat/`
+    try:
+        r_f = session.get(
+            f"https://www.instagram.com/api/v1/fbsearch/topsearch_flat/?search_surface=top_search_page&query={urllib.parse.quote(u)}",
+            timeout=14,
+        )
+        if r_f.status_code == 200:
+            search_succeeded = True
+            data_f = r_f.json()
+            for item in data_f.get("list", []):
+                usr = (item or {}).get("user") or {}
+                if str(usr.get("username", "")).lower() == u_low:
+                    pk = str(usr.get("pk") or usr.get("id") or "").strip()
+                    if pk.isdigit():
+                        return pk, None
+    except Exception:
+        pass
+
+    # 3. Если поиск отработал со статусом 200, но точного совпадения username нет — проверяем, существует ли страница вообще
+    try:
+        r_og = requests.get(
+            f"https://www.instagram.com/{urllib.parse.quote(u)}/",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"},
+            timeout=10,
+        )
+        if r_og.status_code == 404 or 'property="og:title"' not in (r_og.text or ""):
+            return None, "not_found"
+    except Exception:
+        if search_succeeded:
+            return None, "not_found"
+
+    # 4. На случай если профиль существует, но скрыт из поиска — пробуем web_profile_info
+    try:
+        r_w = session.get(
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(u)}",
+            timeout=12,
+        )
+        if r_w.status_code == 200:
+            user_obj = ((r_w.json().get("data") or {}).get("user") or {})
             pk = str(user_obj.get("id") or "").strip()
             if pk.isdigit():
                 return pk, None
     except Exception:
         pass
 
-    # 2. Резервный эндпоинт поиска topsearch
-    try:
-        r2 = session.get(
-            f"https://www.instagram.com/web/search/topsearch/?context=blended&query={urllib.parse.quote(u)}",
-            timeout=15,
-        )
-        if r2.status_code == 200:
-            data2 = r2.json()
-            for item in data2.get("users", []):
-                usr = (item or {}).get("user") or {}
-                if str(usr.get("username", "")).lower() == u.lower():
-                    pk = str(usr.get("pk") or usr.get("id") or "").strip()
-                    if pk.isdigit():
-                        return pk, None
-    except Exception:
-        pass
+    if search_succeeded:
+        return None, "not_found"
 
     return None, "Не удалось получить ID профиля в Instagram"
 

@@ -1431,9 +1431,9 @@ function renderQueueList() {
   } else {
     list.innerHTML = chosen.map(p => {
       let stBadge = '';
-      if (p.exec_status === 'done') stBadge = '<span style="color:#6ee7b7;font-size:11px;font-weight:700;">✅ Выполнено в IG</span>';
+      if (p.exec_status === 'done') stBadge = `<span style="color:#6ee7b7;font-size:11px;font-weight:700;">✅ ${p.exec_msg || 'Выполнено в IG'}</span>`;
       else if (p.exec_status === 'pending' && autoIgInfo.connected) stBadge = '<span style="color:#fde68a;font-size:11px;font-weight:700;">⏳ В очереди IG...</span>';
-      else if (p.exec_status === 'error') stBadge = `<span style="color:#fda4af;font-size:11px;font-weight:700;" title="${p.exec_msg || ''}">⚠️ Ошибка</span>`;
+      else if (p.exec_status === 'error') stBadge = `<span style="color:#fda4af;font-size:11px;font-weight:700;">⚠️ Ошибка (${p.exec_msg || 'не удалось'})</span>`;
       return `
       <div class="queue-item">
         <div>

@@ -324,7 +324,7 @@ async def _run_ig_auto_worker(uid_str: str):
                     cur_entry["exec_status"] = "done"
                     cur_entry["exec_msg"] = res.get("message", "OK")
                     cur_entry["executed_at"] = now_iso
-                elif res.get("auth_error") or res.get("rate_limit"):
+                elif res.get("status") in ("auth_error", "rate_limit") or res.get("auth_error") or res.get("rate_limit"):
                     cur_entry["exec_status"] = "pending"
                     cur_entry["exec_msg"] = res.get("message", "Пауза")
                     ig_crypto_db.vault_storage.save_meta(uid_str, {"paused_reason": res.get("message", "Пауза Instagram")})
@@ -339,7 +339,8 @@ async def _run_ig_auto_worker(uid_str: str):
 
             if res.get("ok"):
                 lbl = ACTION_RU_LABELS.get(act_now, act_now)
-                executed_batch.append(f"• <code>@{html.escape(uname)}</code> — {lbl}")
+                note = f" <i>({html.escape(res.get('message', ''))})</i>" if res.get("status") == "not_found" else ""
+                executed_batch.append(f"• <code>@{html.escape(uname)}</code> — {lbl}{note}")
                 # Если в очереди больше никого нет — сразу уведомим пользователя
                 def _has_more_pending():
                     _, acts, _ = ensure_user_vault_loaded(uid_str)
@@ -354,7 +355,7 @@ async def _run_ig_auto_worker(uid_str: str):
                         uid_str,
                         f"🤖 <b>Выполнено автоматически в Instagram:</b>\n{batch_txt}",
                     )
-            elif res.get("auth_error") or res.get("rate_limit"):
+            elif res.get("status") in ("auth_error", "rate_limit") or res.get("auth_error") or res.get("rate_limit"):
                 if executed_batch:
                     batch_txt = "\n".join(executed_batch)
                     executed_batch.clear()
