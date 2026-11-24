@@ -99,6 +99,8 @@ def _build_ig_session(cookie_dict: Dict[str, str]) -> requests.Session:
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
         "X-IG-App-ID": IG_APP_ID,
+        "X-ASBD-ID": "129477",
+        "X-IG-WWW-Claim": "0",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://www.instagram.com",
         "Referer": "https://www.instagram.com/",
@@ -117,6 +119,37 @@ def _build_ig_session(cookie_dict: Dict[str, str]) -> requests.Session:
     csrf = s.cookies.get("csrftoken") or cookie_dict.get("csrftoken") or "missing"
     s.headers["X-CSRFToken"] = csrf
     return s
+
+
+def _fetch_ig_post_tokens(session: requests.Session) -> Dict[str, str]:
+    """
+    Получает с главной страницы Instagram обязательные токены безопасности для POST-мутаций:
+    - `fb_dtsg` (из `DTSGInitialData` / `DTSGInitData`)
+    - `jazoest` (`"2" + sum(ord(c) for c in fb_dtsg)`)
+    - `rollout_hash` (для заголовка `X-Instagram-AJAX`)
+    Без `fb_dtsg` и `jazoest` Instagram с 2025/2026 года отклоняет POST `/api/v1/friendships/destroy/...`
+    и возвращает HTML-страницу `PolarisErrorRoot (httpErrorPage)` со статусом HTTP 200!
+    """
+    csrf = session.cookies.get("csrftoken") or session.headers.get("X-CSRFToken") or ""
+    tokens = {
+        "fb_dtsg": "",
+        "jazoest": ("2" + str(sum(ord(c) for c in csrf))) if csrf else "",
+        "rollout_hash": "1056057460",
+    }
+    try:
+        r_home = session.get("https://www.instagram.com/", timeout=12)
+        html_txt = r_home.text or ""
+        m_dtsg = re.search(r'"DTSGInit(?:ial)?Data"\s*,\s*\[\]\s*,\s*\{"token"\s*:\s*"([^"]+)"', html_txt)
+        if m_dtsg:
+            fb_dtsg = m_dtsg.group(1)
+            tokens["fb_dtsg"] = fb_dtsg
+            tokens["jazoest"] = "2" + str(sum(ord(c) for c in fb_dtsg))
+        m_roll = re.search(r'"rollout_hash"\s*:\s*"([^"]+)"', html_txt)
+        if m_roll:
+            tokens["rollout_hash"] = m_roll.group(1)
+    except Exception:
+        pass
+    return tokens
 
 
 def verify_ig_session_sync(cookie_dict: Dict[str, str]) -> Dict[str, Any]:
@@ -345,14 +378,25 @@ def execute_ig_action_sync(
 
     session.headers["Referer"] = f"https://www.instagram.com/{username.strip().lstrip('@')}/"
     session.headers["Content-Type"] = "application/x-www-form-urlencoded"
+    post_tokens = _fetch_ig_post_tokens(session)
+    session.headers["X-Instagram-AJAX"] = post_tokens["rollout_hash"]
     if session.cookies.get("csrftoken"):
         session.headers["X-CSRFToken"] = session.cookies.get("csrftoken")
+
+    post_payload: Dict[str, str] = {
+        "container_module": "profile",
+        "user_id": target_uid,
+    }
+    if post_tokens["fb_dtsg"]:
+        post_payload["fb_dtsg"] = post_tokens["fb_dtsg"]
+    if post_tokens["jazoest"]:
+        post_payload["jazoest"] = post_tokens["jazoest"]
 
     try:
         if action in ("unfollow_me", "mutual_break"):
             r1 = session.post(
                 f"https://www.instagram.com/api/v1/friendships/destroy/{target_uid}/",
-                data={"container_module": "profile", "user_id": target_uid},
+                data=post_payload,
                 timeout=15,
             )
             st1, msg1 = _classify_ig_post_response(r1)
@@ -365,7 +409,7 @@ def execute_ig_action_sync(
         if action in ("remove_follower", "mutual_break"):
             r2 = session.post(
                 f"https://www.instagram.com/api/v1/friendships/remove_follower/{target_uid}/",
-                data={"container_module": "profile", "user_id": target_uid},
+                data=post_payload,
                 timeout=15,
             )
             st2, msg2 = _classify_ig_post_response(r2)
