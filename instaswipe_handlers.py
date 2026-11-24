@@ -30,23 +30,32 @@ from ig_webapp_ui import MINIAPP_HTML
 
 instaswipe_router = APIRouter()
 _client_ref = None
+_handlers_registered = False
+_last_ig_error = ""
 MAX_IG_FILE_BYTES = 150 * 1024 * 1024  # до 150 МБ через Telethon MTProto
+
+
+def _clean_url_str(val: Optional[str]) -> str:
+    return (val or "").strip().strip('"').strip("'").strip().rstrip("/")
 
 
 def get_public_base_url() -> str:
     """Находит публичный HTTPS адрес сервиса (WEBAPP_URL, RENDER_EXTERNAL_URL или домен из REDIRECT_URI)."""
     for candidate in (
         WEBAPP_URL,
+        os.getenv("WEBAPP_URL", ""),
         os.getenv("RENDER_EXTERNAL_URL", ""),
     ):
-        c = (candidate or "").strip().rstrip("/")
+        c = _clean_url_str(candidate)
         if c.startswith("https://") and "localhost" not in c and "127.0.0.1" not in c:
             return c
-    redir = (REDIRECT_URI or "").strip()
+    redir = _clean_url_str(REDIRECT_URI or os.getenv("REDIRECT_URI", ""))
     if redir.startswith("https://") and "/gmail/callback" in redir:
         return redir.split("/gmail/callback")[0].rstrip("/")
+    if os.getenv("RENDER"):
+        return "https://telegram-christina.onrender.com"
     port = os.getenv("PORT", "8000")
-    return (WEBAPP_URL or f"http://localhost:{port}").strip().rstrip("/")
+    return _clean_url_str(WEBAPP_URL or f"http://localhost:{port}")
 
 
 def build_instaswipe_webapp_url(tg_user_id: int | str) -> str:
@@ -396,17 +405,12 @@ async def try_handle_instagram_file_upload(client, event, uid: int, user_states:
 # ============================================================================
 
 async def send_instaswipe_hub(client, event, uid: int, user_states: Optional[dict] = None):
-    if user_states is not None:
-        # Включаем мягкий режим готовности принять любой .zip/.json, не мешая обычным текстам
-        pass
-    msg_html = await asyncio.to_thread(format_radar_message_html, uid)
-    kb = make_instaswipe_keyboard(uid)
+    global _last_ig_error
     try:
-        await client.send_message(event.chat_id, msg_html, parse_mode="html", buttons=kb, reply_to=event.id)
-    except Exception:
-        # На случай невалидного домена WebView откатываемся на обычную URL-кнопку
-        fallback_kb = [
-            [Button.url("🌐 Открыть InstaSwipe", build_instaswipe_webapp_url(uid))],
+        msg_html = await asyncio.to_thread(format_radar_message_html, uid)
+        app_url = build_instaswipe_webapp_url(uid)
+        is_priv = bool(getattr(event, "is_private", True))
+        common_rows = [
             [
                 Button.inline("📊 Мой Инста-Радар", data=b"igvault:stats"),
                 Button.inline("📥 Скачать решения", data=b"igvault:export"),
@@ -416,12 +420,39 @@ async def send_instaswipe_hub(client, event, uid: int, user_states: Optional[dic
                 Button.inline("🔥 Стереть из БД", data=b"igvault:wipe_ask"),
             ],
         ]
-        await client.send_message(event.chat_id, msg_html, parse_mode="html", buttons=fallback_kb, reply_to=event.id)
+
+        # 1. Пробуем нативный Telegram Mini App WebView (разрешён в личных чатах при HTTPS)
+        if is_priv and app_url.startswith("https://"):
+            try:
+                kb_webview = [[types.KeyboardButtonWebView("🚀 Открыть InstaSwipe Mini App", app_url)]] + common_rows
+                await client.send_message(event.chat_id, msg_html, parse_mode="html", buttons=kb_webview, reply_to=event.id)
+                return
+            except Exception as ex1:
+                _last_ig_error = f"WebView fallback: {ex1}"
+
+        # 2. Пробуем обычную HTTPS URL-кнопку
+        if app_url.startswith("https://"):
+            try:
+                kb_url = [[Button.url("🚀 Открыть InstaSwipe", app_url)]] + common_rows
+                await client.send_message(event.chat_id, msg_html, parse_mode="html", buttons=kb_url, reply_to=event.id)
+                return
+            except Exception as ex2:
+                _last_ig_error = f"URL button fallback: {ex2}"
+
+        # 3. Железобетонный фоллбэк: ссылка в тексте + inline-кнопки
+        msg_with_link = msg_html + f"\n\n🔗 <a href=\"{html.escape(app_url, quote=True)}\">Открыть InstaSwipe</a>"
+        await client.send_message(event.chat_id, msg_with_link, parse_mode="html", buttons=common_rows, reply_to=event.id, link_preview=False)
+    except Exception as ex:
+        _last_ig_error = f"Fatal send_instaswipe_hub: {ex}"
+        await event.reply(f"❌ Ошибка открытия InstaSwipe: {ex}")
 
 
 def register_instaswipe_handlers(client, user_states: dict):
-    global _client_ref
+    global _client_ref, _handlers_registered
     _client_ref = client
+    if _handlers_registered:
+        return
+    _handlers_registered = True
 
     @client.on(events.NewMessage(pattern=r'(?i)^/(insta|instaswipe|instagram|ig|unfollow)(@\w+)?(\s|$)'))
     async def insta_cmd(e):
@@ -491,6 +522,27 @@ def register_instaswipe_handlers(client, user_states: dict):
 @instaswipe_router.get("/instaswipe/", response_class=HTMLResponse)
 async def instaswipe_page():
     return MINIAPP_HTML
+
+
+@instaswipe_router.get("/api/instaswipe/health")
+async def instaswipe_health():
+    connected = bool(_client_ref and _client_ref.is_connected())
+    bot_uname = ""
+    if connected:
+        try:
+            me = await _client_ref.get_me()
+            bot_uname = getattr(me, "username", "") or ""
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "handlers_registered": _handlers_registered,
+        "bot_connected": connected,
+        "bot_username": bot_uname,
+        "public_base_url": get_public_base_url(),
+        "backend": ig_crypto_db.vault_storage.backend_name,
+        "last_error": _last_ig_error,
+    }
 
 
 @instaswipe_router.get("/api/instaswipe/data")

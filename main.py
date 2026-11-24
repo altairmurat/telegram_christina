@@ -892,11 +892,11 @@ async def on_callback(event):
 async def startup_event():
     try: models.Base.metadata.create_all(bind=engine)
     except Exception as e: print(f"DB init error: {e}")
-    await client.start(bot_token=BOT_TOKEN)
     register_dgist_handlers(client, user_states)
     register_event_handlers(client, user_states)
     register_instaswipe_handlers(client, user_states)
     register_everytime_handlers(client, user_states)
+    await client.start(bot_token=BOT_TOKEN)
     asyncio.create_task(run_reminder_worker(client))
     try:
         await client(functions.bots.SetBotCommandsRequest(
