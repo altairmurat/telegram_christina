@@ -21,7 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, File, Header, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
-from telethon import events, Button, types
+from telethon import events, Button
+from telethon.tl import types as tl_types
 
 from env import OWNER_ID, WEBAPP_URL, REDIRECT_URI
 import ig_crypto_db
@@ -64,13 +65,14 @@ def build_instaswipe_webapp_url(tg_user_id: int | str) -> str:
     return f"{base}/instaswipe?token={tok}"
 
 
-def make_instaswipe_keyboard(tg_user_id: int | str) -> list:
+def make_instaswipe_keyboard(tg_user_id: int | str, allow_webview: bool = True) -> list:
     app_url = build_instaswipe_webapp_url(tg_user_id)
     rows = []
-    if app_url.startswith("https://"):
-        rows.append([types.KeyboardButtonWebView("🚀 Открыть InstaSwipe Mini App", app_url)])
-    else:
-        rows.append([Button.url("🌐 Открыть InstaSwipe в браузере", app_url)])
+    webview_cls = getattr(tl_types, "KeyboardButtonWebView", None)
+    if allow_webview and webview_cls and app_url.startswith("https://"):
+        rows.append([webview_cls("🚀 Открыть InstaSwipe Mini App", app_url)])
+    elif app_url.startswith("https://") or app_url.startswith("http://"):
+        rows.append([Button.url("🚀 Открыть InstaSwipe", app_url)])
     rows.append([
         Button.inline("📊 Мой Инста-Радар", data=b"igvault:stats"),
         Button.inline("📥 Скачать решения", data=b"igvault:export"),
@@ -82,6 +84,64 @@ def make_instaswipe_keyboard(tg_user_id: int | str) -> list:
     return rows
 
 
+async def _send_or_edit_with_instaswipe_kb(
+    client,
+    chat_id: int,
+    msg_html: str,
+    uid: int | str,
+    is_private: bool = True,
+    edit_msg=None,
+    reply_to: Optional[int] = None,
+):
+    """Отправляет или редактирует сообщение с 3-уровневым фоллбэком кнопки (WebView -> URL -> текстовая ссылка)."""
+    global _last_ig_error
+    app_url = build_instaswipe_webapp_url(uid)
+
+    # Попытка 1: Нативный Telegram WebView (в личке по HTTPS)
+    if is_private and app_url.startswith("https://") and getattr(tl_types, "KeyboardButtonWebView", None):
+        kb1 = make_instaswipe_keyboard(uid, allow_webview=True)
+        try:
+            if edit_msg:
+                await edit_msg.edit(msg_html, parse_mode="html", buttons=kb1)
+            else:
+                await client.send_message(chat_id, msg_html, parse_mode="html", buttons=kb1, reply_to=reply_to)
+            return
+        except Exception as ex1:
+            # Telethon иногда не даёт заменить обычное сообщение на WebView через edit — пробуем новый send_message
+            if edit_msg:
+                try:
+                    await client.send_message(chat_id, msg_html, parse_mode="html", buttons=kb1, reply_to=reply_to)
+                    try:
+                        await edit_msg.delete()
+                    except Exception:
+                        pass
+                    return
+                except Exception as ex1b:
+                    _last_ig_error = f"WebView send fallback: {ex1b}"
+            else:
+                _last_ig_error = f"WebView fallback: {ex1}"
+
+    # Попытка 2: Обычная URL-кнопка
+    if app_url.startswith("https://"):
+        kb2 = make_instaswipe_keyboard(uid, allow_webview=False)
+        try:
+            if edit_msg:
+                await edit_msg.edit(msg_html, parse_mode="html", buttons=kb2)
+            else:
+                await client.send_message(chat_id, msg_html, parse_mode="html", buttons=kb2, reply_to=reply_to)
+            return
+        except Exception as ex2:
+            _last_ig_error = f"URL button fallback: {ex2}"
+
+    # Попытка 3: Ссылка в тексте + inline-кнопки
+    common_rows = make_instaswipe_keyboard(uid, allow_webview=False)[1:]
+    msg_with_link = msg_html + f"\n\n🔗 <a href=\"{html.escape(app_url, quote=True)}\">Открыть InstaSwipe</a>"
+    if edit_msg:
+        await edit_msg.edit(msg_with_link, parse_mode="html", buttons=common_rows, link_preview=False)
+    else:
+        await client.send_message(chat_id, msg_with_link, parse_mode="html", buttons=common_rows, reply_to=reply_to, link_preview=False)
+
+
 # ============================================================================
 # Работа с зашифрованным сейфом пользователя
 # ============================================================================
@@ -90,7 +150,7 @@ def resolve_tg_user_id(
     x_telegram_init_data: Optional[str] = None,
     x_session_token: Optional[str] = None,
     query_token: Optional[str] = None,
-) -> str:
+) -> Optional[str]:
     if x_telegram_init_data:
         uid = ig_crypto_db.verify_telegram_webapp_init_data(x_telegram_init_data)
         if uid:
@@ -100,7 +160,10 @@ def resolve_tg_user_id(
         uid = ig_crypto_db.verify_signed_session_token(tok)
         if uid:
             return uid
-    return str(OWNER_ID)
+    # В локальной разработке разрешаем OWNER_ID, а на публичном HTTPS требуем подписанный токен или Telegram initData
+    if not get_public_base_url().startswith("https://"):
+        return str(OWNER_ID)
+    return None
 
 
 def ensure_user_vault_loaded(
@@ -387,16 +450,15 @@ async def try_handle_instagram_file_upload(client, event, uid: int, user_states:
         f"• ⏳ Висящие заявки: <b>{s['pending_count']}</b>\n\n"
         f"<i>Можешь докинуть ещё JSON-файлы в чат (они склеятся автоматически) или запускай Tinder-свайпалку ниже 👇</i>"
     )
-    kb = make_instaswipe_keyboard(uid)
-    if st_msg:
-        try:
-            await st_msg.edit(reply_html, parse_mode="html", buttons=kb)
-        except Exception:
-            # Fallback если кнопка WebView требует новый send_message или HTTP URL
-            await st_msg.delete()
-            await client.send_message(event.chat_id, reply_html, parse_mode="html", buttons=kb, reply_to=event.id)
-    else:
-        await client.send_message(event.chat_id, reply_html, parse_mode="html", buttons=kb, reply_to=event.id)
+    await _send_or_edit_with_instaswipe_kb(
+        client,
+        event.chat_id,
+        reply_html,
+        uid,
+        is_private=bool(getattr(event, "is_private", True)),
+        edit_msg=st_msg,
+        reply_to=event.id,
+    )
     return True
 
 
@@ -408,40 +470,14 @@ async def send_instaswipe_hub(client, event, uid: int, user_states: Optional[dic
     global _last_ig_error
     try:
         msg_html = await asyncio.to_thread(format_radar_message_html, uid)
-        app_url = build_instaswipe_webapp_url(uid)
-        is_priv = bool(getattr(event, "is_private", True))
-        common_rows = [
-            [
-                Button.inline("📊 Мой Инста-Радар", data=b"igvault:stats"),
-                Button.inline("📥 Скачать решения", data=b"igvault:export"),
-            ],
-            [
-                Button.inline("📖 Как выгрузить из IG", data=b"igvault:howto"),
-                Button.inline("🔥 Стереть из БД", data=b"igvault:wipe_ask"),
-            ],
-        ]
-
-        # 1. Пробуем нативный Telegram Mini App WebView (разрешён в личных чатах при HTTPS)
-        if is_priv and app_url.startswith("https://"):
-            try:
-                kb_webview = [[types.KeyboardButtonWebView("🚀 Открыть InstaSwipe Mini App", app_url)]] + common_rows
-                await client.send_message(event.chat_id, msg_html, parse_mode="html", buttons=kb_webview, reply_to=event.id)
-                return
-            except Exception as ex1:
-                _last_ig_error = f"WebView fallback: {ex1}"
-
-        # 2. Пробуем обычную HTTPS URL-кнопку
-        if app_url.startswith("https://"):
-            try:
-                kb_url = [[Button.url("🚀 Открыть InstaSwipe", app_url)]] + common_rows
-                await client.send_message(event.chat_id, msg_html, parse_mode="html", buttons=kb_url, reply_to=event.id)
-                return
-            except Exception as ex2:
-                _last_ig_error = f"URL button fallback: {ex2}"
-
-        # 3. Железобетонный фоллбэк: ссылка в тексте + inline-кнопки
-        msg_with_link = msg_html + f"\n\n🔗 <a href=\"{html.escape(app_url, quote=True)}\">Открыть InstaSwipe</a>"
-        await client.send_message(event.chat_id, msg_with_link, parse_mode="html", buttons=common_rows, reply_to=event.id, link_preview=False)
+        await _send_or_edit_with_instaswipe_kb(
+            client,
+            event.chat_id,
+            msg_html,
+            uid,
+            is_private=bool(getattr(event, "is_private", True)),
+            reply_to=event.id,
+        )
     except Exception as ex:
         _last_ig_error = f"Fatal send_instaswipe_hub: {ex}"
         await event.reply(f"❌ Ошибка открытия InstaSwipe: {ex}")
@@ -485,11 +521,14 @@ def register_instaswipe_handlers(client, user_states: dict):
         if act == "stats":
             await event.answer()
             msg_html = await asyncio.to_thread(format_radar_message_html, uid)
-            kb = make_instaswipe_keyboard(uid)
-            try:
-                await event.edit(msg_html, parse_mode="html", buttons=kb)
-            except Exception:
-                await client.send_message(event.chat_id, msg_html, parse_mode="html", buttons=kb)
+            await _send_or_edit_with_instaswipe_kb(
+                client,
+                event.chat_id,
+                msg_html,
+                uid,
+                is_private=bool(getattr(event, "is_private", True)),
+                edit_msg=event,
+            )
         elif act == "export":
             await event.answer("Готовлю файлы...")
             ok = await send_exports_via_telethon(event.chat_id, uid)
@@ -554,6 +593,20 @@ async def api_ig_get_data(
     x_vault_pin: Optional[str] = Header(default=""),
 ):
     uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({
+            "profiles": [],
+            "summary": {},
+            "privacy": {
+                "blind_uid": "Открой через кнопку в Telegram-боте (/insta)",
+                "exists": False,
+                "has_pin": False,
+                "locked": False,
+                "backend": ig_crypto_db.vault_storage.backend_name,
+                "cipher_preview": "—",
+                "ciphertext_bytes": 0,
+            },
+        })
     raw_state, actions, pinfo = await asyncio.to_thread(ensure_user_vault_loaded, uid, x_vault_pin or "")
     if pinfo.get("locked"):
         return JSONResponse({"profiles": [], "summary": {}, "privacy": pinfo})
@@ -574,6 +627,8 @@ async def api_ig_save_action(
     x_vault_pin: Optional[str] = Header(default=""),
 ):
     uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized: open from Telegram bot (/insta)"}, status_code=401)
     body = await request.json()
     username = str(body.get("username", "")).strip()
     action = str(body.get("action", "")).strip()
@@ -602,6 +657,8 @@ async def api_ig_batch_action(
     x_vault_pin: Optional[str] = Header(default=""),
 ):
     uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized: open from Telegram bot (/insta)"}, status_code=401)
     body = await request.json()
     usernames = body.get("usernames", [])
     action = str(body.get("action", "unfollow_me")).strip()
@@ -629,6 +686,8 @@ async def api_ig_upload_files(
     x_vault_pin: Optional[str] = Header(default=""),
 ):
     uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized: open from Telegram bot (/insta)"}, status_code=401)
     bundle: List[Tuple[str, bytes]] = []
     for f in files:
         content = await f.read()
@@ -659,6 +718,8 @@ async def api_ig_set_pin(
     x_session_token: Optional[str] = Header(default=None),
 ):
     uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     body = await request.json()
     new_pin = str(body.get("pin", "")).strip()
     old_pin = str(body.get("old_pin", "")).strip()
@@ -679,6 +740,8 @@ async def api_ig_wipe(
     x_session_token: Optional[str] = Header(default=None),
 ):
     uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     deleted = await asyncio.to_thread(ig_crypto_db.vault_storage.wipe_vault, uid)
     return {"ok": True, "deleted": deleted}
 
