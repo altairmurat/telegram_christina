@@ -157,6 +157,7 @@ class UserIntent(BaseModel):
         default="chat",
         description=(
             "'video' ONLY if user explicitly asks to generate/create/make a video or animate a photo; "
+            "'instagram' if user asks to open InstaSwipe / Instagram followers checker Mini App, check Instagram stats/radar, or manage Instagram unfollowers (e.g. 'открой инстасвайп', 'проверь инсту', 'чекер подписчиков инсты', 'покажи инста-радар'); if user asks a specific question about a username or list of unfollowers (e.g. 'взаимна ли @user в инсте?', 'назови топ невзаимных в инсте'), set intent='instagram' and instagram_action='query'; "
             "'event_register' if user asks to register/apply for a lecture/seminar/event, fill a Google Form, or find/check lectures with free dinner (e.g. 'запиши меня на пост #24', 'подай заявку на лекцию', 'найди лекции с бесплатным ужином', 'заполни эту гугл форму https://...'); "
             "'calendar' if user asks to add/create/schedule a plan, event, or reminder in Google Calendar OR asks to view/check upcoming plans/calendar; "
             "'email' ONLY if user explicitly asks to write/send/compose an email to someone; "
@@ -170,6 +171,8 @@ class UserIntent(BaseModel):
     )
     is_video: bool = Field(default=False, description="True if intent == 'video' or user asks to generate/make a video or animate an image")
     video_prompt_en: str = Field(default="", description="Detailed visual prompt in English for generating the video (translate user's video idea into vivid English visual description)")
+    is_instagram: bool = Field(default=False, description="True if intent == 'instagram'")
+    instagram_action: str = Field(default="hub", description="'hub' to open InstaSwipe Mini App & radar card, 'query' if user asks a specific analytical question about their Instagram followers/unfollowers/@username")
     is_event_register: bool = Field(default=False, description="True if intent == 'event_register'")
     event_scan_dinner: bool = Field(default=False, description="True if user asks to find/scan for lectures/events with free dinner on the portal")
     event_post_ref: str = Field(default="", description="Post number (e.g. '#24') or event title keyword if user asks to register for a specific post/lecture")
@@ -225,6 +228,7 @@ async def parse_user_intent(text: str, user_id: int | None = None) -> UserIntent
     try:
         data = UserIntent.model_validate_json(res.text or "{}")
         if data.intent == "video": data.is_video = True
+        elif data.intent == "instagram": data.is_instagram = True
         elif data.intent == "event_register": data.is_event_register = True
         elif data.intent == "email": data.is_email = True
         elif data.intent == "pdf": data.is_pdf = True
@@ -353,6 +357,20 @@ async def ask_gemini(chat_text: str, user_id: int | None = None) -> str:
             "Если пользователь спрашивает про какой-то пост с Everytime, просит перевести комментарии или рассказать подробности:\n---\n"
             + et_ctx
         )
+
+    low_chat = (chat_text or "").lower()
+    if user_id and any(k in low_chat for k in ("инст", "insta", "подпис", "отпис", "взаим", "призрак", "ghost", "unfollow", "follow")):
+        try:
+            from instaswipe_handlers import get_instagram_ai_context_for_user
+            ig_ctx = await asyncio.to_thread(get_instagram_ai_context_for_user, int(user_id), chat_text)
+            if ig_ctx:
+                sys_inst += (
+                    "\n\nУ пользователя в боте подключён личный зашифрованный сейф Instagram (InstaSwipe Vault, команда /insta открывает Tinder Mini App для свайпов). "
+                    "Используй данные его сейфа ниже, чтобы точно ответить на вопрос:\n---\n"
+                    + ig_ctx
+                )
+        except Exception:
+            pass
 
     cfg = types.GenerateContentConfig(
         system_instruction=sys_inst + TG_HTML_STYLE_INSTRUCTION,

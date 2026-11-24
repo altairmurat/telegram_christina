@@ -168,3 +168,18 @@ class EventRegistration(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+
+class EncryptedVault(Base):
+    """Zero-Knowledge зашифрованный сейф выгрузок Instagram (InstaSwipe Vault) без привязки к открытому Telegram ID."""
+    __tablename__ = "encrypted_vaults"
+
+    blind_uid = Column(String, primary_key=True)  # HMAC-SHA256 необратимый слепой идентификатор
+    encrypted_dataset = Column(Text, nullable=False)  # zlib + AES-256-GCM блоб профилей Instagram
+    encrypted_actions = Column(Text, nullable=False)  # zlib + AES-256-GCM блоб решений (свайпы, теги, корзина)
+    encrypted_meta = Column(Text, nullable=False, default="")  # AES-256-GCM метаданные
+    has_pin = Column(Boolean, nullable=False, default=False)
+    schema_version = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+

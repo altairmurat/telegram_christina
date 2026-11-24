@@ -54,9 +54,14 @@ from fal_video import (
     get_admin_prefs, set_admin_prefs, extract_hints_from_text
 )
 from agy_self_improve import execute_self_improvement_sync, rollback_github_branch
+from instaswipe_handlers import (
+    instaswipe_router, register_instaswipe_handlers,
+    try_handle_instagram_file_upload, send_instaswipe_hub
+)
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 app = FastAPI()
+app.include_router(instaswipe_router)
 client = TelegramClient('session_bot_korean', API_ID, API_HASH)
 
 user_states, draft_cache, text_cache, pkce_store, video_job_cache = {}, {}, {}, {}, {}
@@ -469,6 +474,10 @@ async def try_handle_email_intent(event, user_id: int, text: str) -> bool:
         await register_from_post_ref_or_url(client, event, user_id, user_states, form_url=m_gf.group(0).rstrip(".,;:!?"))
         return True
     intent = await parse_user_intent(text, user_id=user_id)
+    if intent.is_instagram and intent.instagram_action != "query":
+        await send_instaswipe_hub(client, event, user_id, user_states)
+        return True
+
     if intent.is_event_register:
         if intent.event_scan_dinner and not intent.event_form_url and not intent.event_post_ref:
             await scan_and_register_dinner_events(client, event, user_id, user_states)
@@ -733,8 +742,8 @@ async def on_callback(event):
     parts = data.split(":")
     action, arg1 = parts[0], parts[1] if len(parts) > 1 else ""
 
-    # Кнопки пагинации журналов DGIST, Everytime и автоподачи на лекции обрабатываются в своих модулях
-    if action in ("dgmag", "etmag", "evreg"):
+    # Кнопки пагинации журналов DGIST, Everytime, автоподачи на лекции и InstaSwipe обрабатываются в своих модулях
+    if action in ("dgmag", "etmag", "evreg", "igvault"):
         return
 
     # Выбор часового пояса
@@ -886,6 +895,7 @@ async def startup_event():
     await client.start(bot_token=BOT_TOKEN)
     register_dgist_handlers(client, user_states)
     register_event_handlers(client, user_states)
+    register_instaswipe_handlers(client, user_states)
     register_everytime_handlers(client, user_states)
     asyncio.create_task(run_reminder_worker(client))
     try:
@@ -894,6 +904,7 @@ async def startup_event():
             lang_code="",
             commands=[
                 types.BotCommand("help", "Все возможности и команды"),
+                types.BotCommand("insta", "InstaSwipe: кто не подписан в ответ в Instagram (Mini App)"),
                 types.BotCommand("dinner", "Найти лекции с бесплатным ужином и подать заявку"),
                 types.BotCommand("register", "Автозаполнение формы Google Forms или поста DGIST"),
                 types.BotCommand("myprofile", "Мои данные для автозаполнения форм"),
@@ -962,6 +973,8 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 
 📌 **Команды:**
 • /help — список возможностей
+• /insta (/instaswipe) — чекер невзаимных подписок Instagram + Tinder Mini App (Zero-Knowledge AES-256)
+• /igexport — выгрузить корзину решений Instagram (`CSV` + `JSON`)
 • /dinner — найти лекции с бесплатным ужином и подать заявку (Google Forms)
 • /register — заполнить любую форму Google Forms или пост DGIST (#номер или ссылка)
 • /myprofile — сохранённые личные данные для автозаполнения форм
@@ -980,6 +993,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 • /cancel — отменить текущее действие
 
 ✨ **Возможности (просто напиши или скажи голосом):**
+• 🔥 **InstaSwipe Vault (Instagram)** — скинь ZIP-архив или JSON-файлы выгрузки Instagram прямо в чат (или нажми /insta), открой Tinder Mini App для свайпов невзаимных/призраков/заявок, или спроси меня *«кто на меня не подписан в инсте?»*. Все данные хранятся с Zero-Knowledge шифрованием AES-256-GCM под анонимным Blind-ID!
 • 🍽 **Автоподача на лекции с бесплатным ужином** — при проверке портала DGIST (или по команде /dinner / «запиши меня на пост #...») я сама нахожу Google Forms, заполняю твои данные, спрашиваю недостающие, присылаю предзаполненную ссылку на проверку и после твоего одобрения записываю тебя!
 • 💬 **Ответы на любые вопросы** — просто напиши мне (в группе тегни через `@` или напиши *«Кристина, ...»*).
 • 🇰🇷 **Парсер DGIST Everytime** — напиши *«чекни еверитайм»*, используй /everytime или скинь прямую ссылку `everytime.kr/393752/v/...`, и я выдам журнал постов по ключевым словам (`foreigner`, `외국인`, `201`, `기숙사`, `dormitory` и др.) с дословным переводом слово в слово и комментариями!
@@ -1499,6 +1513,10 @@ async def necessary_task_handler(event):
         except Exception as ex:
             await st.edit(f"❌ Ошибка обработки PDF: {ex}")
         return
+
+    if event.message and event.message.file:
+        if await try_handle_instagram_file_upload(client, event, uid, user_states):
+            return
 
     is_pdf_doc = False
     pdf_filename = "document.pdf"
