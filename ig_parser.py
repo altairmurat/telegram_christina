@@ -413,6 +413,8 @@ def compile_dataset_from_raw(
         act_obj = actions_map.get(u, {})
         act = act_obj.get("action", "") if isinstance(act_obj, dict) else ""
         tag = act_obj.get("tag", "") if isinstance(act_obj, dict) else ""
+        exec_status = act_obj.get("exec_status", "") if isinstance(act_obj, dict) else ""
+        exec_msg = act_obj.get("exec_msg", "") if isinstance(act_obj, dict) else ""
         is_keep = (act == "keep") or bool(tag)
 
         tie_score = min(100, raw_inter_points * 2 + (60 if is_cf else 0) + (25 if is_keep else 0) + (15 if tab == "mutual" else 0))
@@ -460,6 +462,8 @@ def compile_dataset_from_raw(
             "tie_tier": tie_tier,
             "action": act,
             "tag": tag,
+            "exec_status": exec_status,
+            "exec_msg": exec_msg,
             "link": f"https://www.instagram.com/{u}/",
         })
 

@@ -615,9 +615,9 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 
   <!-- Sub-toolbar: Smart Batch + Hide Done -->
   <div class="toolbar">
+    <button class="tool-btn" id="autoIgBtn" onclick="openAutoIgModal()" style="border-color:#10b981;color:#6ee7b7;">🤖 IG Авто: выкл</button>
     <button class="tool-btn" id="toggleDoneBtn" onclick="toggleHideDone()">👁 Скрывать решённые: ДА</button>
     <button class="tool-btn" onclick="autoSelectGhosts()">⚡ Авто-выбор призраков</button>
-    <button class="tool-btn" onclick="openModal('privacyModal')">🛡 Мой Blind-ID</button>
   </div>
 
   <!-- 4 Tabs -->
@@ -821,15 +821,42 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
     <div class="modal-header">
       <span>🛒 Корзина решений</span>
       <div style="display:flex;gap:5px;">
-        <button class="tool-btn active" onclick="sendExportToBot()">📩 В Telegram-бот</button>
+        <button class="tool-btn active" onclick="openAutoIgModal()">🤖 IG Авто</button>
+        <button class="tool-btn" onclick="sendExportToBot()">📩 В бот</button>
         <button class="tool-btn" onclick="exportActionsJson()">⬇ JSON</button>
         <button class="tool-btn" onclick="closeModal('queueModal')">✕</button>
       </div>
     </div>
     <div style="font-size:11.5px;color:var(--muted);">
-      Все решения мгновенно шифруются и сохраняются в твоём сейфе. Нажми <b>«📩 В Telegram-бот»</b>, чтобы бот прислал готовые файлы в чат, или <b>«⬇ JSON»</b>.
+      Если подключена сессия в <b>«🤖 IG Авто»</b>, каждое решение <b>автоматически выполняется</b> на сервере Кристины (отписка / удаление подписчика).
     </div>
     <div class="modal-list" id="queueList"></div>
+  </div>
+</div>
+
+<!-- 5. Модалка: Облачная авто-отписка Instagram (sessionid) -->
+<div class="modal-backdrop" id="autoIgModal" onclick="if(event.target===this)closeModal('autoIgModal')">
+  <div class="modal">
+    <div class="modal-header">
+      <span>🤖 Облачная авто-отписка в Instagram</span>
+      <button class="tool-btn" onclick="closeModal('autoIgModal')">Закрыть ✕</button>
+    </div>
+    <div id="autoIgStatusBox" class="code-box" style="font-family:inherit;font-size:12px;line-height:1.45;">
+      Статус: не подключено
+    </div>
+    <div style="font-size:11.5px;color:var(--muted);line-height:1.45;">
+      Когда кука <code>sessionid</code> подключена, Кристина <b>мгновенно сама отписывается или удаляет подписчика</b> сразу после твоего свайпа в Mini App (а при массовом выборе — с безопасной анти-спам паузой 22–35 сек).<br/>
+      🛡 Кука шифруется <b>AES-256-GCM</b> в твоём сейфе. Где взять: открой <code>instagram.com</code> на ПК → <code>F12</code> → <b>Application → Cookies</b> → скопируй <code>sessionid</code> (или отправь боту команду <code>/connectig</code>).
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <input class="search-input" type="password" id="igCookieInput" placeholder="Вставь сюда sessionid (или JSON кук)..." />
+      <button class="tool-btn active" onclick="connectIgCookieFromApp()">🔌 Подключить</button>
+    </div>
+    <div id="autoIgActionBtns" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:2px;">
+      <button class="tool-btn active" onclick="triggerRunCartNow()">🚀 Выполнить всю корзину в IG</button>
+      <button class="tool-btn" id="btnToggleAutoPause" onclick="toggleAutoIgPause()">⏸ Пауза / Продолжить</button>
+      <button class="tool-btn" style="border-color:#ef4444;color:#fca5a5;" onclick="disconnectIgCookieFromApp()">Отключить куку</button>
+    </div>
   </div>
 </div>
 
@@ -843,6 +870,8 @@ if (tg) {
 let allProfiles = [];
 let summaryData = {};
 let privacyInfo = {};
+let autoIgInfo = { connected: false, ig_username: '', auto_execute: true, paused_reason: '', pending_count: 0, done_count: 0 };
+let pollTimer = null;
 let viewList = [];
 let currentTab = 'not_back';
 let currentSort = 'oldest';
@@ -920,6 +949,7 @@ async function init() {
   allProfiles = (data && data.profiles) ? data.profiles : [];
   summaryData = (data && data.summary) ? data.summary : {};
   privacyInfo = (data && data.privacy) ? data.privacy : {};
+  autoIgInfo = (data && data.auto_ig) ? data.auto_ig : { connected: false, pending_count: 0, done_count: 0 };
 
   const localMap = getLocalActions();
   allProfiles.forEach(p => {
@@ -931,9 +961,82 @@ async function init() {
   });
 
   renderPrivacyInfo();
+  renderAutoIgStatus();
   updateCounts();
   applyFilterAndSort();
   setupSwipe();
+  scheduleAutoIgPoll();
+}
+
+function renderAutoIgStatus() {
+  const btn = document.getElementById('autoIgBtn');
+  const box = document.getElementById('autoIgStatusBox');
+  const pauseBtn = document.getElementById('btnToggleAutoPause');
+  if (!btn || !box) return;
+
+  if (!autoIgInfo || !autoIgInfo.connected) {
+    btn.textContent = '🤖 IG Авто: выкл';
+    btn.style.borderColor = '#47557a';
+    btn.style.color = '#cbd5e1';
+    box.innerHTML = '⚪ <b>Сессия Instagram не подключена.</b><br/>Вставь <code>sessionid</code> ниже или отправь <code>/connectig</code> боту Кристине.';
+    return;
+  }
+
+  const uDisp = autoIgInfo.ig_username ? `@${autoIgInfo.ig_username}` : `ID ${autoIgInfo.ig_ds_user_id || ''}`;
+  const pend = autoIgInfo.pending_count || 0;
+  const done = autoIgInfo.done_count || 0;
+
+  if (autoIgInfo.paused_reason) {
+    btn.textContent = `⚠️ IG Авто: пауза (${pend})`;
+    btn.style.borderColor = '#f59e0b';
+    btn.style.color = '#fde68a';
+    box.innerHTML = `⚠️ <b>Аккаунт ${uDisp} на паузе:</b><br/><code>${autoIgInfo.paused_reason}</code><br/>Выполнено: <b>${done}</b> · В очереди: <b>${pend}</b>`;
+    if (pauseBtn) pauseBtn.textContent = '▶ Продолжить выполнение';
+  } else if (!autoIgInfo.auto_execute) {
+    btn.textContent = `⏸ IG Авто (${uDisp})`;
+    btn.style.borderColor = '#f59e0b';
+    btn.style.color = '#fde68a';
+    box.innerHTML = `⏸ <b>Авто-выполнение приостановлено (${uDisp})</b><br/>В очереди: <b>${pend}</b> · Выполнено в IG: <b>${done}</b>`;
+    if (pauseBtn) pauseBtn.textContent = '▶ Включить авто-отписку';
+  } else {
+    btn.textContent = pend > 0 ? `🤖 IG Авто: ⏳${pend} | ✅${done}` : `🟢 IG Авто: ${uDisp} (✅${done})`;
+    btn.style.borderColor = '#10b981';
+    btn.style.color = '#6ee7b7';
+    box.innerHTML = `🟢 <b>Подключён ${uDisp} — Авто-отписка ВКЛ</b><br/>⏳ В очереди сейчас: <b>${pend}</b> · ✅ Выполнено в IG: <b>${done}</b>`;
+    if (pauseBtn) pauseBtn.textContent = '⏸ Поставить на паузу';
+  }
+}
+
+function scheduleAutoIgPoll() {
+  if (pollTimer) clearInterval(pollTimer);
+  if (isStaticMode) return;
+  pollTimer = setInterval(async () => {
+    if (!autoIgInfo || !autoIgInfo.connected) return;
+    if ((autoIgInfo.pending_count || 0) <= 0 && !document.getElementById('autoIgModal').classList.contains('open') && !document.getElementById('queueModal').classList.contains('open')) return;
+    try {
+      const res = await fetch('/api/instaswipe/data', { headers: authHeaders() });
+      if (!res.ok) return;
+      const d = await res.json();
+      if (d.auto_ig) {
+        autoIgInfo = d.auto_ig;
+        renderAutoIgStatus();
+      }
+      if (d.profiles) {
+        const statusMap = {};
+        d.profiles.forEach(pr => { statusMap[pr.username] = { exec_status: pr.exec_status || '', exec_msg: pr.exec_msg || '', action: pr.action || '' }; });
+        allProfiles.forEach(p => {
+          if (statusMap[p.username]) {
+            p.exec_status = statusMap[p.username].exec_status;
+            p.exec_msg = statusMap[p.username].exec_msg;
+          }
+        });
+        renderCard();
+        if (document.getElementById('queueModal').classList.contains('open')) {
+          renderQueueList();
+        }
+      }
+    } catch (e) {}
+  }, 4500);
 }
 
 function renderPrivacyInfo() {
@@ -1091,6 +1194,9 @@ function renderCard() {
 
   if (p.tag) badges.push(`<span class="badge cf">🏷 ${p.tag}</span>`);
   if (p.action) badges.push(`<span class="badge action-tag">Решение: ${ACTION_LABELS[p.action] || p.action}</span>`);
+  if (p.exec_status === 'done') badges.push('<span class="badge cf">✅ Выполнено в IG</span>');
+  else if (p.exec_status === 'pending' && autoIgInfo.connected) badges.push('<span class="badge pending">⏳ В очереди IG...</span>');
+  else if (p.exec_status === 'error') badges.push('<span class="badge not_back">⚠️ Ошибка IG</span>');
   document.getElementById('cardBadges').innerHTML = badges.join('');
 
   document.querySelectorAll('.tag-chip').forEach(btn => {
@@ -1109,6 +1215,11 @@ async function decide(action, customTag = null) {
 
   p.action = action === 'reset' ? '' : action;
   if (customTag !== null) p.tag = customTag;
+  if (['unfollow_me', 'remove_follower', 'mutual_break'].includes(p.action)) {
+    p.exec_status = 'pending';
+  } else if (!p.action) {
+    p.exec_status = '';
+  }
   setLocalAction(p.username, p.action, p.tag);
 
   haptic(action === 'keep' ? 'success' : 'medium');
@@ -1118,6 +1229,11 @@ async function decide(action, customTag = null) {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ username: p.username, action: p.action, tag: p.tag || '' })
+    }).then(r => r.json()).then(out => {
+      if (out && out.auto_ig) {
+        autoIgInfo = out.auto_ig;
+        renderAutoIgStatus();
+      }
     }).catch(() => {});
   }
 
@@ -1307,23 +1423,117 @@ function openRadarModal() {
   openModal('radarModal');
 }
 
-function openQueueModal() {
+function renderQueueList() {
   const list = document.getElementById('queueList');
   const chosen = allProfiles.filter(p => p.action && p.action !== 'keep');
   if (chosen.length === 0) {
     list.innerHTML = '<div style="color:var(--muted);padding:12px 0;">Пока никого не выбрано</div>';
   } else {
-    list.innerHTML = chosen.map(p => `
+    list.innerHTML = chosen.map(p => {
+      let stBadge = '';
+      if (p.exec_status === 'done') stBadge = '<span style="color:#6ee7b7;font-size:11px;font-weight:700;">✅ Выполнено в IG</span>';
+      else if (p.exec_status === 'pending' && autoIgInfo.connected) stBadge = '<span style="color:#fde68a;font-size:11px;font-weight:700;">⏳ В очереди IG...</span>';
+      else if (p.exec_status === 'error') stBadge = `<span style="color:#fda4af;font-size:11px;font-weight:700;" title="${p.exec_msg || ''}">⚠️ Ошибка</span>`;
+      return `
       <div class="queue-item">
         <div>
-          <strong>@${p.username}</strong>
+          <strong>@${p.username}</strong> ${stBadge}
           <div style="font-size:11px;color:var(--muted);">${ACTION_LABELS[p.action] || p.action}</div>
         </div>
         <button class="tool-btn" onclick="resetAction('${p.username}')">Отменить</button>
       </div>
-    `).join('');
+    `;
+    }).join('');
   }
+}
+
+function openQueueModal() {
+  renderQueueList();
   openModal('queueModal');
+}
+
+function openAutoIgModal() {
+  renderAutoIgStatus();
+  openModal('autoIgModal');
+}
+
+async function connectIgCookieFromApp() {
+  const inp = document.getElementById('igCookieInput');
+  const val = (inp.value || '').trim();
+  if (!val) {
+    alert('Вставь значение куки sessionid из браузера (instagram.com).');
+    return;
+  }
+  const box = document.getElementById('autoIgStatusBox');
+  box.innerHTML = '🔐 Проверяю сессию в Instagram и шифрую AES-256-GCM...';
+  try {
+    const res = await fetch('/api/instaswipe/connect_cookie', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ cookie: val })
+    });
+    const out = await res.json();
+    if (res.ok && out.ok) {
+      haptic('success');
+      inp.value = '';
+      autoIgInfo = out.auto_ig || autoIgInfo;
+      renderAutoIgStatus();
+      await init();
+    } else {
+      haptic('error');
+      const msg = (out.result && out.result.message) || out.error || 'Не удалось подключить sessionid';
+      box.innerHTML = `❌ <b>Ошибка:</b> <code>${msg}</code>`;
+    }
+  } catch (e) {
+    box.innerHTML = '❌ Ошибка соединения с сервером Кристины.';
+  }
+}
+
+async function triggerRunCartNow() {
+  if (!autoIgInfo || !autoIgInfo.connected) {
+    alert('Сначала подключи куку sessionid выше!');
+    return;
+  }
+  const res = await fetch('/api/instaswipe/toggle_auto', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ auto_execute: true, run_cart_now: true })
+  });
+  const out = await res.json();
+  if (out && out.auto_ig) {
+    haptic('success');
+    autoIgInfo = out.auto_ig;
+    renderAutoIgStatus();
+  }
+}
+
+async function toggleAutoIgPause() {
+  if (!autoIgInfo || !autoIgInfo.connected) return;
+  const nextState = (autoIgInfo.paused_reason || !autoIgInfo.auto_execute) ? true : false;
+  const res = await fetch('/api/instaswipe/toggle_auto', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ auto_execute: nextState })
+  });
+  const out = await res.json();
+  if (out && out.auto_ig) {
+    haptic('light');
+    autoIgInfo = out.auto_ig;
+    renderAutoIgStatus();
+  }
+}
+
+async function disconnectIgCookieFromApp() {
+  if (!confirm('Отключить авто-отписку и стереть зашифрованную куку sessionid из сейфа?')) return;
+  const res = await fetch('/api/instaswipe/disconnect_cookie', {
+    method: 'POST',
+    headers: authHeaders()
+  });
+  const out = await res.json();
+  if (out && out.auto_ig) {
+    autoIgInfo = out.auto_ig;
+    renderAutoIgStatus();
+  }
 }
 
 async function resetAction(username) {

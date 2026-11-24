@@ -16,7 +16,9 @@ import html
 import io
 import json
 import os
+import random
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, File, Header, Request, UploadFile
@@ -25,6 +27,7 @@ from telethon import events, Button
 from telethon.tl import types as tl_types
 
 from env import OWNER_ID, WEBAPP_URL, REDIRECT_URI
+import ig_cloud_actor
 import ig_crypto_db
 import ig_parser
 from ig_webapp_ui import MINIAPP_HTML
@@ -34,6 +37,16 @@ _client_ref = None
 _handlers_registered = False
 _last_ig_error = ""
 MAX_IG_FILE_BYTES = 150 * 1024 * 1024  # до 150 МБ через Telethon MTProto
+
+# Очередь автоматических действий в Instagram (по одному таску на пользователя)
+_ig_worker_tasks: Dict[str, asyncio.Task] = {}
+_ig_last_exec_ts: Dict[str, float] = {}
+EXECUTABLE_IG_ACTIONS = ("unfollow_me", "remove_follower", "mutual_break")
+ACTION_RU_LABELS = {
+    "unfollow_me": "Отписаться самому",
+    "remove_follower": "Удалить из подписчиков",
+    "mutual_break": "Взаимный разрыв (отписаться + удалить)",
+}
 
 
 def _clean_url_str(val: Optional[str]) -> str:
@@ -75,11 +88,12 @@ def make_instaswipe_keyboard(tg_user_id: int | str, allow_webview: bool = True) 
         rows.append([Button.url("🚀 Открыть InstaSwipe", app_url)])
     rows.append([
         Button.inline("📊 Мой Инста-Радар", data=b"igvault:stats"),
-        Button.inline("📥 Скачать решения", data=b"igvault:export"),
+        Button.inline("🤖 Авто-отписка (IG)", data=b"igvault:connectig"),
     ])
     rows.append([
-        Button.inline("📖 Как выгрузить из IG", data=b"igvault:howto"),
-        Button.inline("🔥 Стереть из БД", data=b"igvault:wipe_ask"),
+        Button.inline("📥 Скачать решения", data=b"igvault:export"),
+        Button.inline("📖 Как выгрузить", data=b"igvault:howto"),
+        Button.inline("🔥 Стереть", data=b"igvault:wipe_ask"),
     ])
     return rows
 
@@ -180,6 +194,197 @@ def ensure_user_vault_loaded(
     return raw_state, actions, pinfo
 
 
+def get_auto_ig_summary(tg_user_id: int | str, actions: Optional[Dict[str, Any]] = None, user_pin: str = "") -> Dict[str, Any]:
+    """Возвращает статус подключения авто-отписки Instagram и счётчики очереди."""
+    meta = ig_crypto_db.vault_storage.load_meta(tg_user_id, user_pin=user_pin)
+    cookies = meta.get("ig_cookies") or {}
+    connected = bool(cookies.get("sessionid"))
+    if actions is None:
+        _, actions, _ = ensure_user_vault_loaded(tg_user_id, user_pin=user_pin)
+    pending_cnt = 0
+    done_cnt = 0
+    error_cnt = 0
+    unqueued_cnt = 0
+    for v in (actions or {}).values():
+        if not isinstance(v, dict):
+            continue
+        act = v.get("action", "")
+        if act not in EXECUTABLE_IG_ACTIONS:
+            continue
+        st = v.get("exec_status", "")
+        if st == "pending":
+            pending_cnt += 1
+        elif st == "done":
+            done_cnt += 1
+        elif st == "error":
+            error_cnt += 1
+        else:
+            unqueued_cnt += 1
+    uid_str = str(tg_user_id)
+    worker_t = _ig_worker_tasks.get(uid_str)
+    worker_running = bool(worker_t and not worker_t.done())
+    return {
+        "connected": connected,
+        "ig_username": meta.get("ig_username", ""),
+        "ig_ds_user_id": meta.get("ig_ds_user_id", ""),
+        "auto_execute": bool(meta.get("auto_execute", True)),
+        "paused_reason": meta.get("paused_reason", ""),
+        "pending_count": pending_cnt,
+        "done_count": done_cnt,
+        "error_count": error_cnt,
+        "unqueued_count": unqueued_cnt,
+        "worker_running": worker_running,
+    }
+
+
+async def _notify_user_tg(tg_user_id: int | str, html_text: str):
+    if not _client_ref or not str(tg_user_id).lstrip("-").isdigit():
+        return
+    try:
+        await _client_ref.send_message(int(tg_user_id), html_text, parse_mode="html", link_preview=False)
+    except Exception:
+        pass
+
+
+async def _run_ig_auto_worker(uid_str: str):
+    """
+    Фоновый воркер облачной авто-отписки/удаления подписчиков:
+    - Первое решение (если прошло >= 20 сек с предыдущего) выполняет МГНОВЕННО (за ~1 сек).
+    - При серии решений подряд выдерживает безопасную анти-спам паузу 22–36 сек между запросами к Instagram.
+    - Перед самым запросом перепроверяет БД: если пользователь нажал «Шаг назад» (Отмена), пропускает!
+    """
+    executed_batch: List[str] = []
+    try:
+        while True:
+            def _fetch_next_candidate():
+                meta = ig_crypto_db.vault_storage.load_meta(uid_str)
+                cookies = meta.get("ig_cookies") or {}
+                if not cookies.get("sessionid"):
+                    return None, None, "no_cookie"
+                if not meta.get("auto_execute", True) or meta.get("paused_reason"):
+                    return None, None, "paused"
+                raw_state, actions, pinfo = ensure_user_vault_loaded(uid_str)
+                if pinfo.get("locked"):
+                    return None, None, "locked"
+                # Ищем первый профиль со статусом pending
+                for uname, info in actions.items():
+                    if isinstance(info, dict) and info.get("action") in EXECUTABLE_IG_ACTIONS and info.get("exec_status") == "pending":
+                        f_obj = (raw_state.get("following") or {}).get(uname) or (raw_state.get("followers") or {}).get(uname) or {}
+                        known_uid = str(f_obj.get("id") or "")
+                        return (uname, info.get("action"), known_uid), cookies, "ok"
+                return None, None, "empty"
+
+            cand, cookies, status = await asyncio.to_thread(_fetch_next_candidate)
+            if status != "ok" or not cand:
+                break
+
+            uname, act_init, known_uid = cand
+            elapsed = time.time() - _ig_last_exec_ts.get(uid_str, 0.0)
+            if elapsed < 20.0:
+                wait_sec = random.uniform(22.0, 35.0) - max(0.0, elapsed)
+                if wait_sec > 1.0:
+                    await asyncio.sleep(wait_sec)
+
+            # Перепроверяем после паузы: не отменил ли пользователь решение («Шаг назад»)
+            def _verify_still_pending():
+                meta = ig_crypto_db.vault_storage.load_meta(uid_str)
+                cookies_now = meta.get("ig_cookies") or {}
+                if not cookies_now.get("sessionid") or not meta.get("auto_execute", True) or meta.get("paused_reason"):
+                    return None, None
+                _, actions_now, pinfo_now = ensure_user_vault_loaded(uid_str)
+                if pinfo_now.get("locked"):
+                    return None, None
+                cur = actions_now.get(uname)
+                if not isinstance(cur, dict) or cur.get("action") not in EXECUTABLE_IG_ACTIONS or cur.get("exec_status") != "pending":
+                    return "skipped", None
+                return cur.get("action"), cookies_now
+
+            act_now, cookies_now = await asyncio.to_thread(_verify_still_pending)
+            if act_now == "skipped":
+                continue
+            if not act_now or not cookies_now:
+                break
+
+            res = await asyncio.to_thread(
+                ig_cloud_actor.execute_ig_action_sync,
+                cookies_now,
+                uname,
+                act_now,
+                known_uid,
+            )
+            _ig_last_exec_ts[uid_str] = time.time()
+
+            def _commit_result():
+                raw_state, actions_cur, _ = ensure_user_vault_loaded(uid_str)
+                cur_entry = actions_cur.get(uname)
+                if not isinstance(cur_entry, dict):
+                    return
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+                if res.get("ok"):
+                    cur_entry["exec_status"] = "done"
+                    cur_entry["exec_msg"] = res.get("message", "OK")
+                    cur_entry["executed_at"] = now_iso
+                elif res.get("auth_error") or res.get("rate_limit"):
+                    cur_entry["exec_status"] = "pending"
+                    cur_entry["exec_msg"] = res.get("message", "Пауза")
+                    ig_crypto_db.vault_storage.save_meta(uid_str, {"paused_reason": res.get("message", "Пауза Instagram")})
+                else:
+                    cur_entry["exec_status"] = "error"
+                    cur_entry["exec_msg"] = res.get("message", "Ошибка")
+                actions_cur[uname] = cur_entry
+                if not ig_crypto_db.vault_storage.update_actions_only(uid_str, actions_cur):
+                    ig_crypto_db.vault_storage.save_vault(uid_str, raw_state, actions_cur)
+
+            await asyncio.to_thread(_commit_result)
+
+            if res.get("ok"):
+                lbl = ACTION_RU_LABELS.get(act_now, act_now)
+                executed_batch.append(f"• <code>@{html.escape(uname)}</code> — {lbl}")
+                # Если в очереди больше никого нет — сразу уведомим пользователя
+                def _has_more_pending():
+                    _, acts, _ = ensure_user_vault_loaded(uid_str)
+                    return any(
+                        isinstance(v, dict) and v.get("action") in EXECUTABLE_IG_ACTIONS and v.get("exec_status") == "pending"
+                        for v in acts.values()
+                    )
+                if not await asyncio.to_thread(_has_more_pending) or len(executed_batch) >= 5:
+                    batch_txt = "\n".join(executed_batch)
+                    executed_batch.clear()
+                    await _notify_user_tg(
+                        uid_str,
+                        f"🤖 <b>Выполнено автоматически в Instagram:</b>\n{batch_txt}",
+                    )
+            elif res.get("auth_error") or res.get("rate_limit"):
+                if executed_batch:
+                    batch_txt = "\n".join(executed_batch)
+                    executed_batch.clear()
+                    await _notify_user_tg(uid_str, f"🤖 <b>Выполнено в Instagram:</b>\n{batch_txt}")
+                await _notify_user_tg(
+                    uid_str,
+                    f"⚠️ <b>Авто-отписка Instagram поставлена на паузу:</b>\n"
+                    f"<code>{html.escape(res.get('message', ''))}</code>\n\n"
+                    f"Обнови куку через /connectig или нажми «Продолжить» в окне <b>🤖 IG Авто</b> внутри Mini App.",
+                )
+                break
+    finally:
+        if executed_batch:
+            batch_txt = "\n".join(executed_batch)
+            await _notify_user_tg(uid_str, f"🤖 <b>Выполнено автоматически в Instagram:</b>\n{batch_txt}")
+
+
+def trigger_ig_auto_worker(tg_user_id: int | str):
+    """Запускает асинхронный фоновый воркер авто-отписки для пользователя, если он ещё не запущен."""
+    uid_str = str(tg_user_id)
+    existing = _ig_worker_tasks.get(uid_str)
+    if existing and not existing.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        _ig_worker_tasks[uid_str] = loop.create_task(_run_ig_auto_worker(uid_str))
+    except RuntimeError:
+        pass
+
+
 def build_export_files(raw_state: Dict[str, Any], actions: Dict[str, Any]) -> Tuple[bytes, bytes]:
     """Генерирует в памяти `tinder_actions.json` и `unfollow_candidates.csv` (готовый для локального Playwright-скрипта)."""
     json_bytes = json.dumps(actions, ensure_ascii=False, indent=2).encode("utf-8")
@@ -238,6 +443,21 @@ def format_radar_message_html(tg_user_id: int | str) -> str:
         1 for v in actions.values()
         if isinstance(v, dict) and v.get("action") and v.get("action") != "keep"
     )
+    auto_info = get_auto_ig_summary(tg_user_id, actions=actions)
+    if auto_info["connected"]:
+        uname_str = f"@{html.escape(auto_info['ig_username'])}" if auto_info["ig_username"] else f"ID {html.escape(auto_info['ig_ds_user_id'])}"
+        if auto_info["paused_reason"]:
+            auto_line = f"• ⚠️ Авто-отписка (на паузе): <b>{uname_str}</b>"
+        elif auto_info["auto_execute"]:
+            auto_line = (
+                f"• 🟢 Авто-отписка в облаке: <b>ВКЛ ({uname_str})</b> "
+                f"[⏳ {auto_info['pending_count']} | ✅ {auto_info['done_count']}]"
+            )
+        else:
+            auto_line = f"• ⏸ Авто-отписка: <b>на паузе ({uname_str})</b>"
+    else:
+        auto_line = "• ⚪ Авто-отписка в облаке: <b>не подключена</b> (нажми «🤖 Авто-отписка» или /connectig)"
+
     lines = [
         "📊 <b>Инста-Радар твоего сейфа (AES-256-GCM)</b>\n",
         f"• Подписки: <b>{s['total_following']}</b> | Подписчики: <b>{s['total_followers']}</b>",
@@ -246,7 +466,8 @@ def format_radar_message_html(tg_user_id: int | str) -> str:
         f"• 👻 Призраки (0% контакта): <b>{s['ghosts_count']}</b>",
         f"• 🤝 Взаимные: <b>{s['mutual_count']}</b> | 🌟 Фанаты: <b>{s['fans_count']}</b>",
         f"• ⏳ Висящие заявки: <b>{s['pending_count']}</b> | ★ Близкие друзья: <b>{s['close_friends_count']}</b>",
-        f"• 🛒 В корзине на отписку: <b>{chosen_cnt}</b>",
+        f"• 🛒 В корзине решений: <b>{chosen_cnt}</b>",
+        auto_line,
     ]
     oldest = s.get("oldest_not_back") or []
     if oldest:
@@ -466,6 +687,118 @@ async def try_handle_instagram_file_upload(client, event, uid: int, user_states:
 # Команды и inline-кнопки Telethon
 # ============================================================================
 
+CONNECT_IG_GUIDE_HTML = (
+    "🤖 <b>Облачная авто-отписка в Instagram (Zero-Knowledge AES-256-GCM)</b>\n\n"
+    "Чтобы Кристина <b>мгновенно сама отписывалась</b> (или удаляла из подписчиков) "
+    "сразу после твоего свайпа в Mini App, подключи куку <code>sessionid</code>:\n\n"
+    "1️⃣ Открой <b>instagram.com</b> в браузере на ПК/телефоне.\n"
+    "2️⃣ Нажми <code>F12</code> → вкладка <b>Application</b> (или <b>Storage</b>) → <b>Cookies</b> → <code>https://www.instagram.com</code>.\n"
+    "3️⃣ Найди строчку <code>sessionid</code>, скопируй её значение (Value) и <b>пришли мне следующим сообщением сюда в чат</b> (или вставь прямо внутри Mini App по кнопке «🤖 IG Авто»).\n\n"
+    "🛡 <i>Я мгновенно удалю твоё сообщение с кукой из чата и зашифрую её AES-256-GCM в твоём сейфе! Для отмены напиши «отмена».</i>"
+)
+
+
+async def _connect_and_activate_cookie(uid: int | str, raw_cookie_text: str, user_pin: str = "") -> Dict[str, Any]:
+    parsed = ig_cloud_actor.parse_ig_cookie_input(raw_cookie_text)
+    if not parsed.get("sessionid"):
+        return {
+            "ok": False,
+            "message": "Не удалось распознать sessionid. Скопируй значение куки sessionid с сайта instagram.com.",
+        }
+    ver = await asyncio.to_thread(ig_cloud_actor.verify_ig_session_sync, parsed)
+    if not ver.get("ok"):
+        return ver
+
+    def _save_and_queue():
+        ig_crypto_db.vault_storage.save_meta(
+            uid,
+            {
+                "ig_cookies": ver["cookies"],
+                "ig_username": ver.get("username", ""),
+                "ig_ds_user_id": ver.get("ds_user_id", ""),
+                "auto_execute": True,
+                "paused_reason": "",
+                "connected_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            },
+            user_pin=user_pin,
+        )
+        # Если в корзине уже были выбранные кандидаты без статуса выполнения — ставим их в очередь!
+        raw_state, actions, pinfo = ensure_user_vault_loaded(uid, user_pin=user_pin)
+        queued_now = 0
+        if not pinfo.get("locked") and actions:
+            for uname, entry in actions.items():
+                if isinstance(entry, dict) and entry.get("action") in EXECUTABLE_IG_ACTIONS:
+                    if entry.get("exec_status") not in ("done", "pending"):
+                        entry["exec_status"] = "pending"
+                        queued_now += 1
+            if queued_now > 0:
+                if not ig_crypto_db.vault_storage.update_actions_only(uid, actions, user_pin=user_pin):
+                    ig_crypto_db.vault_storage.save_vault(uid, raw_state, actions, user_pin=user_pin)
+        return queued_now
+
+    queued_cnt = await asyncio.to_thread(_save_and_queue)
+    trigger_ig_auto_worker(uid)
+    ver["queued_count"] = queued_cnt
+    return ver
+
+
+async def handle_instaswipe_conversation_step(
+    client, event, uid: int, state: Optional[str], user_states: dict
+) -> bool:
+    """Обрабатывает шаг ожидания куки Instagram (`waiting_for_ig_cookie`)."""
+    if state != "waiting_for_ig_cookie":
+        return False
+
+    text = (event.raw_text or "").strip()
+    if not text or text.startswith("/"):
+        return False
+
+    if text.lower() in ("отмена", "cancel", "стоп", "выход"):
+        user_states.pop(uid, None)
+        await event.reply("👌 Подключение авто-отписки отменено.")
+        return True
+
+    # Удаляем сообщение пользователя с кукой из чата для безопасности
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    wait_msg = await client.send_message(
+        event.chat_id,
+        "🔐 Проверяю сессию Instagram и шифрую куку <code>AES-256-GCM</code>...",
+        parse_mode="html",
+    )
+    res = await _connect_and_activate_cookie(uid, text)
+    if not res.get("ok"):
+        await wait_msg.edit(
+            f"❌ <b>Не удалось подключить сессию Instagram:</b>\n"
+            f"<code>{html.escape(res.get('message', 'Ошибка'))}</code>\n\n"
+            f"Попробуй прислать свежее значение <code>sessionid</code> ещё раз или напиши «отмена».",
+            parse_mode="html",
+        )
+        return True
+
+    user_states.pop(uid, None)
+    uname_disp = f"@{html.escape(res['username'])}" if res.get("username") else f"ID {html.escape(res.get('ds_user_id', ''))}"
+    q_cnt = res.get("queued_count", 0)
+    q_line = (
+        f"\n🚀 В корзине уже было <b>{q_cnt}</b> решений — я уже запустила их выполнение в фоне!"
+        if q_cnt > 0
+        else "\nТеперь любое твоё решение («Отписаться», «Удалить подписчика», «Разрыв») в Mini App будет автоматически выполняться в Instagram!"
+    )
+    await _send_or_edit_with_instaswipe_kb(
+        client,
+        event.chat_id,
+        f"✅ <b>Авто-отписка Instagram подключена ({uname_disp})!</b>\n"
+        f"🛡 Кука зашифрована AES-256-GCM, твоё сообщение с ней удалено из чата.{q_line}",
+        uid,
+        is_private=bool(getattr(event, "is_private", True)),
+        edit_msg=wait_msg,
+    )
+    return True
+
+
 async def send_instaswipe_hub(client, event, uid: int, user_states: Optional[dict] = None):
     global _last_ig_error
     try:
@@ -498,6 +831,42 @@ def register_instaswipe_handlers(client, user_states: dict):
     async def igstats_cmd(e):
         await send_instaswipe_hub(client, e, e.sender_id, user_states)
 
+    @client.on(events.NewMessage(pattern=r'(?i)^/(connectig|igcookie|iglogin)(@\w+)?(?:\s+(.*))?$'))
+    async def connectig_cmd(e):
+        arg = (e.pattern_match.group(3) or "").strip()
+        if arg:
+            try:
+                await e.delete()
+            except Exception:
+                pass
+            w = await client.send_message(e.chat_id, "🔐 Проверяю и шифрую куку Instagram...")
+            res = await _connect_and_activate_cookie(e.sender_id, arg)
+            if not res.get("ok"):
+                await w.edit(f"❌ Ошибка подключения: <code>{html.escape(res.get('message', ''))}</code>", parse_mode="html")
+                return
+            uname_disp = f"@{html.escape(res['username'])}" if res.get("username") else f"ID {html.escape(res.get('ds_user_id', ''))}"
+            await _send_or_edit_with_instaswipe_kb(
+                client,
+                e.chat_id,
+                f"✅ <b>Авто-отписка Instagram подключена ({uname_disp})!</b>",
+                e.sender_id,
+                is_private=bool(getattr(e, "is_private", True)),
+                edit_msg=w,
+            )
+            return
+        user_states[e.sender_id] = "waiting_for_ig_cookie"
+        await e.reply(CONNECT_IG_GUIDE_HTML, parse_mode="html")
+
+    @client.on(events.NewMessage(pattern=r'(?i)^/igdisconnect(@\w+)?(\s|$)'))
+    async def igdisconnect_cmd(e):
+        await asyncio.to_thread(
+            ig_crypto_db.vault_storage.save_meta,
+            e.sender_id,
+            {"ig_cookies": {}, "ig_username": "", "ig_ds_user_id": "", "auto_execute": False, "paused_reason": ""},
+        )
+        user_states.pop(e.sender_id, None)
+        await e.reply("🔌 Сессия Instagram отключена и удалена из зашифрованного сейфа.")
+
     @client.on(events.NewMessage(pattern=r'(?i)^/igexport(@\w+)?(\s|$)'))
     async def igexport_cmd(e):
         ok = await send_exports_via_telethon(e.chat_id, e.sender_id)
@@ -529,6 +898,19 @@ def register_instaswipe_handlers(client, user_states: dict):
                 is_private=bool(getattr(event, "is_private", True)),
                 edit_msg=event,
             )
+        elif act == "connectig":
+            await event.answer()
+            auto_info = await asyncio.to_thread(get_auto_ig_summary, uid)
+            user_states[uid] = "waiting_for_ig_cookie"
+            status_hdr = ""
+            if auto_info["connected"]:
+                u_lbl = f"@{html.escape(auto_info['ig_username'])}" if auto_info["ig_username"] else f"ID {html.escape(auto_info['ig_ds_user_id'])}"
+                status_hdr = (
+                    f"🟢 <b>Сейчас подключён аккаунт:</b> <code>{u_lbl}</code> "
+                    f"(в очереди: <b>{auto_info['pending_count']}</b>, выполнено: <b>{auto_info['done_count']}</b>)\n"
+                    f"Отключить сессию: /igdisconnect\n\n"
+                )
+            await event.respond(status_hdr + CONNECT_IG_GUIDE_HTML, parse_mode="html")
         elif act == "export":
             await event.answer("Готовлю файлы...")
             ok = await send_exports_via_telethon(event.chat_id, uid)
@@ -597,6 +979,17 @@ async def api_ig_get_data(
         return JSONResponse({
             "profiles": [],
             "summary": {},
+            "auto_ig": {
+                "connected": False,
+                "ig_username": "",
+                "auto_execute": True,
+                "paused_reason": "",
+                "pending_count": 0,
+                "done_count": 0,
+                "error_count": 0,
+                "unqueued_count": 0,
+                "worker_running": False,
+            },
             "privacy": {
                 "blind_uid": "Открой через кнопку в Telegram-боте (/insta)",
                 "exists": False,
@@ -609,12 +1002,16 @@ async def api_ig_get_data(
         })
     raw_state, actions, pinfo = await asyncio.to_thread(ensure_user_vault_loaded, uid, x_vault_pin or "")
     if pinfo.get("locked"):
-        return JSONResponse({"profiles": [], "summary": {}, "privacy": pinfo})
+        return JSONResponse({"profiles": [], "summary": {}, "privacy": pinfo, "auto_ig": {"connected": False}})
     compiled = await asyncio.to_thread(ig_parser.compile_dataset_from_raw, raw_state, actions)
+    auto_ig = await asyncio.to_thread(get_auto_ig_summary, uid, actions, x_vault_pin or "")
+    if auto_ig["connected"] and auto_ig["auto_execute"] and not auto_ig["paused_reason"] and auto_ig["pending_count"] > 0:
+        trigger_ig_auto_worker(uid)
     return JSONResponse({
         "profiles": compiled["profiles"],
         "summary": compiled["summary"],
         "privacy": pinfo,
+        "auto_ig": auto_ig,
     })
 
 
@@ -637,15 +1034,35 @@ async def api_ig_save_action(
     def _save():
         raw_state, actions, _ = ensure_user_vault_loaded(uid, user_pin=x_vault_pin or "")
         now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        prev = actions.get(username) if isinstance(actions.get(username), dict) else {}
         if action == "reset" and not tag:
             actions.pop(username, None)
         else:
-            actions[username] = {"action": action, "tag": tag, "updated_at": now}
+            # Если действие уже было выполнено в IG и само действие не поменялось (например, добавили тег), сохраняем done
+            if prev.get("action") == action and prev.get("exec_status") == "done":
+                exec_status = "done"
+                exec_msg = prev.get("exec_msg", "")
+            elif action in EXECUTABLE_IG_ACTIONS:
+                exec_status = "pending"
+                exec_msg = ""
+            else:
+                exec_status = ""
+                exec_msg = ""
+            actions[username] = {
+                "action": action,
+                "tag": tag,
+                "updated_at": now,
+                "exec_status": exec_status,
+                "exec_msg": exec_msg,
+            }
         if not ig_crypto_db.vault_storage.update_actions_only(uid, actions, user_pin=x_vault_pin or ""):
             ig_crypto_db.vault_storage.save_vault(uid, raw_state, actions, user_pin=x_vault_pin or "")
+        return get_auto_ig_summary(uid, actions, x_vault_pin or "")
 
-    await asyncio.to_thread(_save)
-    return {"ok": True}
+    auto_ig = await asyncio.to_thread(_save)
+    if action in EXECUTABLE_IG_ACTIONS and auto_ig["connected"] and auto_ig["auto_execute"] and not auto_ig["paused_reason"]:
+        trigger_ig_auto_worker(uid)
+    return {"ok": True, "auto_ig": auto_ig}
 
 
 @instaswipe_router.post("/api/instaswipe/batch_action")
@@ -666,14 +1083,106 @@ async def api_ig_batch_action(
     def _batch():
         raw_state, actions, _ = ensure_user_vault_loaded(uid, user_pin=x_vault_pin or "")
         now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        exec_st = "pending" if action in EXECUTABLE_IG_ACTIONS else ""
         for u in usernames:
             if u:
-                actions[str(u)] = {"action": action, "tag": "", "updated_at": now}
+                u_str = str(u)
+                prev = actions.get(u_str) if isinstance(actions.get(u_str), dict) else {}
+                if prev.get("action") == action and prev.get("exec_status") == "done":
+                    continue
+                actions[u_str] = {
+                    "action": action,
+                    "tag": prev.get("tag", ""),
+                    "updated_at": now,
+                    "exec_status": exec_st,
+                    "exec_msg": "",
+                }
         if not ig_crypto_db.vault_storage.update_actions_only(uid, actions, user_pin=x_vault_pin or ""):
             ig_crypto_db.vault_storage.save_vault(uid, raw_state, actions, user_pin=x_vault_pin or "")
+        return get_auto_ig_summary(uid, actions, x_vault_pin or "")
 
-    await asyncio.to_thread(_batch)
-    return {"ok": True, "count": len(usernames)}
+    auto_ig = await asyncio.to_thread(_batch)
+    if action in EXECUTABLE_IG_ACTIONS and auto_ig["connected"] and auto_ig["auto_execute"] and not auto_ig["paused_reason"]:
+        trigger_ig_auto_worker(uid)
+    return {"ok": True, "count": len(usernames), "auto_ig": auto_ig}
+
+
+@instaswipe_router.post("/api/instaswipe/connect_cookie")
+async def api_ig_connect_cookie(
+    request: Request,
+    x_telegram_init_data: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+    x_vault_pin: Optional[str] = Header(default=""),
+):
+    uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    raw_cookie = str(body.get("cookie", "")).strip()
+    res = await _connect_and_activate_cookie(uid, raw_cookie, user_pin=x_vault_pin or "")
+    auto_ig = await asyncio.to_thread(get_auto_ig_summary, uid, None, x_vault_pin or "")
+    return {"ok": bool(res.get("ok")), "result": res, "auto_ig": auto_ig}
+
+
+@instaswipe_router.post("/api/instaswipe/toggle_auto")
+async def api_ig_toggle_auto(
+    request: Request,
+    x_telegram_init_data: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+    x_vault_pin: Optional[str] = Header(default=""),
+):
+    uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    auto_execute = body.get("auto_execute")
+    run_cart_now = bool(body.get("run_cart_now", False))
+
+    def _update():
+        updates: Dict[str, Any] = {"paused_reason": ""}
+        if auto_execute is not None:
+            updates["auto_execute"] = bool(auto_execute)
+        if run_cart_now:
+            updates["auto_execute"] = True
+        ig_crypto_db.vault_storage.save_meta(uid, updates, user_pin=x_vault_pin or "")
+        raw_state, actions, pinfo = ensure_user_vault_loaded(uid, user_pin=x_vault_pin or "")
+        if run_cart_now and not pinfo.get("locked"):
+            changed = 0
+            for uname, entry in actions.items():
+                if isinstance(entry, dict) and entry.get("action") in EXECUTABLE_IG_ACTIONS:
+                    if entry.get("exec_status") != "done":
+                        entry["exec_status"] = "pending"
+                        entry["exec_msg"] = ""
+                        changed += 1
+            if changed > 0:
+                if not ig_crypto_db.vault_storage.update_actions_only(uid, actions, user_pin=x_vault_pin or ""):
+                    ig_crypto_db.vault_storage.save_vault(uid, raw_state, actions, user_pin=x_vault_pin or "")
+        return get_auto_ig_summary(uid, actions, x_vault_pin or "")
+
+    auto_ig = await asyncio.to_thread(_update)
+    if auto_ig["connected"] and auto_ig["auto_execute"] and auto_ig["pending_count"] > 0:
+        trigger_ig_auto_worker(uid)
+    return {"ok": True, "auto_ig": auto_ig}
+
+
+@instaswipe_router.post("/api/instaswipe/disconnect_cookie")
+async def api_ig_disconnect_cookie(
+    request: Request,
+    x_telegram_init_data: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+    x_vault_pin: Optional[str] = Header(default=""),
+):
+    uid = resolve_tg_user_id(x_telegram_init_data, x_session_token, request.query_params.get("token"))
+    if not uid:
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    await asyncio.to_thread(
+        ig_crypto_db.vault_storage.save_meta,
+        uid,
+        {"ig_cookies": {}, "ig_username": "", "ig_ds_user_id": "", "auto_execute": False, "paused_reason": ""},
+        x_vault_pin or "",
+    )
+    auto_ig = await asyncio.to_thread(get_auto_ig_summary, uid, None, x_vault_pin or "")
+    return {"ok": True, "auto_ig": auto_ig}
 
 
 @instaswipe_router.post("/api/instaswipe/upload")

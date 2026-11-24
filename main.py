@@ -56,7 +56,8 @@ from fal_video import (
 from agy_self_improve import execute_self_improvement_sync, rollback_github_branch
 from instaswipe_handlers import (
     instaswipe_router, register_instaswipe_handlers,
-    try_handle_instagram_file_upload, send_instaswipe_hub
+    try_handle_instagram_file_upload, send_instaswipe_hub,
+    handle_instaswipe_conversation_step
 )
 
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -908,6 +909,8 @@ async def startup_event():
                 types.BotCommand("dinner", "Найти лекции с бесплатным ужином и подать заявку"),
                 types.BotCommand("register", "Автозаполнение формы Google Forms или поста DGIST"),
                 types.BotCommand("myprofile", "Мои данные для автозаполнения форм"),
+                types.BotCommand("insta", "InstaSwipe: чекер невзаимных подписок + Tinder Mini App"),
+                types.BotCommand("connectig", "Подключить облачную авто-отписку Instagram (sessionid)"),
                 types.BotCommand("everytime", "Журнал постов DGIST Everytime с переводом"),
                 types.BotCommand("etkeywords", "Ключевые слова для фильтра Everytime"),
                 types.BotCommand("connecteverytime", "Подключить DGIST Everytime"),
@@ -974,6 +977,7 @@ HELP_TEXT = """🤖 **Что умеет Кристина:**
 📌 **Команды:**
 • /help — список возможностей
 • /insta (/instaswipe) — чекер невзаимных подписок Instagram + Tinder Mini App (Zero-Knowledge AES-256)
+• /connectig — подключить облачную авто-отписку/удаление подписчиков Instagram (через `sessionid`)
 • /igexport — выгрузить корзину решений Instagram (`CSV` + `JSON`)
 • /dinner — найти лекции с бесплатным ужином и подать заявку (Google Forms)
 • /register — заполнить любую форму Google Forms или пост DGIST (#номер или ссылка)
@@ -1399,6 +1403,7 @@ async def necessary_task_handler(event):
     if await handle_dgist_conversation_step(event, uid, state, user_states): return
     if await handle_everytime_conversation_step(event, uid, state, user_states): return
     if await handle_event_reg_conversation_step(client, event, uid, state, user_states): return
+    if await handle_instaswipe_conversation_step(client, event, uid, state, user_states): return
 
     if state == "antigravity_mode" and is_owner(uid):
         if event.message.voice:

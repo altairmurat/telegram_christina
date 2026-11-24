@@ -174,15 +174,22 @@ class EncryptedVaultStorage:
 
         enc_dataset = encrypt_json_blob(dataset, aes_key)
         enc_actions = encrypt_json_blob(actions, aes_key)
-        meta_obj = meta or {
-            "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        enc_meta = encrypt_json_blob(meta_obj, aes_key)
         has_pin = bool(user_pin.strip())
         now_dt = datetime.datetime.utcnow()
 
         with SessionLocal() as db:
             row = db.query(models.EncryptedVault).filter_by(blind_uid=blind_uid).first()
+            existing_meta = {}
+            if row and row.encrypted_meta:
+                try:
+                    existing_meta = decrypt_json_blob(row.encrypted_meta, aes_key, default={}) or {}
+                except Exception:
+                    existing_meta = {}
+            if meta is not None:
+                existing_meta.update(meta)
+            existing_meta["saved_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            enc_meta = encrypt_json_blob(existing_meta, aes_key)
+
             if not row:
                 row = models.EncryptedVault(
                     blind_uid=blind_uid,
@@ -270,6 +277,56 @@ class EncryptedVaultStorage:
             row.updated_at = datetime.datetime.utcnow()
             db.commit()
             return True
+
+    def load_meta(self, tg_user_id: int | str, user_pin: str = "") -> Dict[str, Any]:
+        """Расшифровывает метаданные сейфа (включая зашифрованную куку Instagram и настройки авто-отписки)."""
+        self._ensure_table()
+        blind_uid = compute_blind_uid(tg_user_id)
+        with SessionLocal() as db:
+            row = db.query(models.EncryptedVault).filter_by(blind_uid=blind_uid).first()
+            if not row or not row.encrypted_meta:
+                return {}
+            enc_m = row.encrypted_meta
+        aes_key = derive_user_aes_key(tg_user_id, user_pin=user_pin)
+        try:
+            data = decrypt_json_blob(enc_m, aes_key, default={})
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_meta(self, tg_user_id: int | str, meta_updates: Dict[str, Any], user_pin: str = "") -> Dict[str, Any]:
+        """Обновляет зашифрованные метаданные сейфа (создавая пустой сейф, если его ещё не было)."""
+        self._ensure_table()
+        blind_uid = compute_blind_uid(tg_user_id)
+        aes_key = derive_user_aes_key(tg_user_id, user_pin=user_pin)
+        now_dt = datetime.datetime.utcnow()
+        with SessionLocal() as db:
+            row = db.query(models.EncryptedVault).filter_by(blind_uid=blind_uid).first()
+            cur_meta: Dict[str, Any] = {}
+            if row and row.encrypted_meta:
+                try:
+                    cur_meta = decrypt_json_blob(row.encrypted_meta, aes_key, default={}) or {}
+                except Exception:
+                    cur_meta = {}
+            cur_meta.update(meta_updates or {})
+            enc_m = encrypt_json_blob(cur_meta, aes_key)
+            if not row:
+                row = models.EncryptedVault(
+                    blind_uid=blind_uid,
+                    encrypted_dataset=encrypt_json_blob({}, aes_key),
+                    encrypted_actions=encrypt_json_blob({}, aes_key),
+                    encrypted_meta=enc_m,
+                    has_pin=bool(user_pin.strip()),
+                    schema_version=1,
+                    created_at=now_dt,
+                    updated_at=now_dt,
+                )
+                db.add(row)
+            else:
+                row.encrypted_meta = enc_m
+                row.updated_at = now_dt
+            db.commit()
+            return cur_meta
 
     def wipe_vault(self, tg_user_id: int | str) -> bool:
         self._ensure_table()
